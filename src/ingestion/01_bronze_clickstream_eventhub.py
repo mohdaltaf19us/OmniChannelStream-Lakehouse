@@ -7,7 +7,7 @@
 # DBTITLE 1, Config
 EH_CONN_STR  = dbutils.secrets.get('omnioc-kv-scope', 'eventhub-clickstream-connection-string')
 CHECKPOINT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze/clickstream_eh/"
-TARGET_TABLE = "omnioc_dev.bronze.clickstream_raw"
+TARGET_TABLE = "omnioc_dev.bronze.clickstream_raw_eh"
 EH_NAMESPACE = "omnioc-dev-eus-ehns-std-01"
 EH_TOPIC     = "eh-clickstream"
 
