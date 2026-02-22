@@ -43,20 +43,20 @@ Everything lands in Bronze as-is, gets cleaned and conformed in Silver, and surf
    (batch files via ADF)                     (streaming into Databricks)
           │                                            │
           └──────────────┬─────────────────────────────┘
-                         │
-                         ▼
+                             │
+                             ▼
               Databricks Bronze Layer
               (Autoloader + Structured Streaming)
-                         │
-                         ▼
+                             │
+                             ▼
               Delta Live Tables (Silver)
               SCD1/2, dedup, quarantine, DQ expectations
-                         │
-                         ▼
+                             │
+                             ▼
               Gold Layer — 4 modelling approaches
               Dimensional │ Data Vault │ Big Table │ Data Mesh
-                         │
-                         ▼
+                             │
+                             ▼
               Unity Catalog (omnioc_dev)
               Domain catalogs, row-level security, access controls
 ```
