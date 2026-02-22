@@ -1,48 +1,108 @@
 # Databricks notebook source
-# MAGIC %md # 04 — Bronze: Autoloader Parquet → Delta
+# MAGIC %md
+# MAGIC # 04 Bronze Autoloader — Parquet Files
+# MAGIC
+# MAGIC **Actual ADLS path (container=landing, subfolder=landing/):**
+# MAGIC - `landing/landing/supply_chain/shipments/shipments.parquet`
+# MAGIC
+# MAGIC **Writes to:** `omnioc_dev.bronze.shipments_raw` via Autoloader trigger-once (batch mode)
 
 # COMMAND ----------
-from pyspark.sql import functions as F
+# DBTITLE 1, Paths & Config
 
-dbutils.widgets.text("catalog",         "omnioc_dev",       "Unity Catalog")
-dbutils.widgets.text("storage_account", "omniocdeveusst01", "ADLS Account")
-dbutils.widgets.text("trigger_once",    "true",             "trigger once?")
+# Container = "landing"
+# Files are inside the landing/landing/... subfolder
+LANDING = "abfss://landing@omniocdeveusst01.dfs.core.windows.net/landing"
+CHKPT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze"
 
-CATALOG         = dbutils.widgets.get("catalog")
-STORAGE_ACCOUNT = dbutils.widgets.get("storage_account")
-TRIGGER_ONCE    = dbutils.widgets.get("trigger_once").lower() == "true"
+# ── Autoloader options for Parquet ────────────────────────────────────────────
+PARQUET_OPTIONS = {
+    # --- Format ---
+    "cloudFiles.format"             : "parquet",
 
-def adls(c, p=""): return f"abfss://{c}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{p}"
-def trigger(): return {"once": True} if TRIGGER_ONCE else {"processingTime": "10 minutes"}
+    # --- Schema handling ---
+    # Parquet is self-describing so schema inference is exact (not estimated like CSV)
+    # schemaLocation still needed for Autoloader to track schema across runs
+    "cloudFiles.schemaEvolutionMode": "addNewColumns",  # add new cols from future files
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.bronze")
+    # --- Rescue ---
+    # Parquet supports rescue col for schema mismatches
+    "cloudFiles.rescuedDataColumn"  : "_rescued_data",
+}
+
+SOURCE_PATH  = f"{LANDING}/supply_chain/shipments/"
+TARGET_TABLE = "omnioc_dev.bronze.shipments_raw"
+SCHEMA_LOC   = f"{CHKPT}/schema/shipments_raw"
+CHKPT_LOC    = f"{CHKPT}/shipments_raw"
+
+print("✅ Config ready")
+print(f"   Source      : {SOURCE_PATH}")
+print(f"   Target      : {TARGET_TABLE}")
+print(f"   Schema loc  : {SCHEMA_LOC}")
+print(f"   Checkpoint  : {CHKPT_LOC}")
 
 # COMMAND ----------
-# MAGIC %md ## 1 — shipments.parquet
+from pyspark.sql.functions import current_timestamp, lit, input_file_name
 
-source      = adls("landing",     "supply_chain/shipments.parquet")
-checkpoint  = adls("checkpoint",  "autoloader/shipments/")
-table       = f"{CATALOG}.bronze.shipments_raw"
+# COMMAND ----------
+# DBTITLE 1, Read Stream
+options = {**PARQUET_OPTIONS, "cloudFiles.schemaLocation": SCHEMA_LOC}
 
-q = (
-    spark.readStream
+df = (spark.readStream
     .format("cloudFiles")
-    .option("cloudFiles.format",              "parquet")
-    .option("cloudFiles.schemaLocation",      checkpoint + "_schema")
-    .option("cloudFiles.schemaEvolutionMode", "rescue")
-    .option("cloudFiles.includeExistingFiles","true")
-    .option("mergeSchema",                    "true")
-    .load(source)
-    .withColumn("_source_file", F.input_file_name())
-    .withColumn("_ingest_time", F.current_timestamp())
-    .withColumn("_source",      F.lit(source))
-    .writeStream
+    .options(**options)
+    .load(SOURCE_PATH)
+    .withColumn("_ingest_time",   current_timestamp())  # when Databricks ingested this row
+    .withColumn("_source_file",   input_file_name())    # full path of source parquet file
+    .withColumn("_source_system", lit("adls_parquet"))  # tag for lineage tracking
+)
+
+print("✅ Stream reader connected")
+print(f"   Schema will be inferred from parquet file metadata")
+df.printSchema()
+
+# COMMAND ----------
+# DBTITLE 1, Write to Delta
+print(f"Writing to {TARGET_TABLE}...")
+
+(df.writeStream
     .format("delta")
     .outputMode("append")
-    .option("checkpointLocation", checkpoint)
-    .option("mergeSchema", "true")
-    .trigger(**trigger())
-    .toTable(table)
+    .option("checkpointLocation", CHKPT_LOC)
+    .option("mergeSchema",        "true")  # merge parquet schema into existing Delta schema
+    .trigger(availableNow=True)            # batch mode: process all pending files then stop
+    .toTable(TARGET_TABLE)
+    .awaitTermination()
 )
-q.awaitTermination()
-print(f"✅ {table} | {spark.table(table).count():,} rows")
+
+count = spark.table(TARGET_TABLE).count()
+print(f"\n✅ {TARGET_TABLE} → {count:,} rows loaded")
+
+# COMMAND ----------
+# DBTITLE 1, Preview & Verify
+print("\n" + "="*65)
+print("  04 Bronze Parquet — Verification")
+print("="*65)
+
+df_check = spark.table(TARGET_TABLE)
+count    = df_check.count()
+
+print(f"  Rows loaded    : {count:,}  (expected ≥ 30,000)")
+print(f"  Columns        : {len(df_check.columns)}")
+print(f"  Source tag     : adls_parquet")
+print(f"  Target table   : {TARGET_TABLE}")
+
+status = "✅ PASS" if count >= 30000 else ("⚠️ LOW" if count > 0 else "❌ EMPTY")
+print(f"  Status         : {status}")
+print("="*65)
+
+# Show sample rows
+print("\nSample rows:")
+df_check.select(
+    "shipment_id","supplier_id","destination_warehouse_id",
+    "product_id","quantity","status","ship_date","_ingest_time"
+).show(5, truncate=False)
+
+# Status distribution
+print("Status breakdown:")
+df_check.groupBy("status").count().orderBy("count", ascending=False).show()

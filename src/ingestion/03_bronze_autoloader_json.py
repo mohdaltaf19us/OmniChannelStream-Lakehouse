@@ -1,183 +1,204 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 03 — Bronze: Autoloader JSON → Delta
-# MAGIC Ingests: `customers.json` · `orders.json` · `order_lines.json` · `payments.json`
-# MAGIC          `refunds.json` · `supplier_contracts.json` (nested struct flattening)
-# MAGIC          `cdc_customers_changes.json` · `cdc_products_changes.json`
+# MAGIC # 03 Bronze Autoloader — JSON Files
+# MAGIC
+# MAGIC **Actual ADLS paths (container=landing, subfolder=landing/):**
+# MAGIC - `landing/landing/finance/customers/customers.json`
+# MAGIC - `landing/landing/finance/orders/orders.json`
+# MAGIC - `landing/landing/finance/order_lines/order_lines.json`
+# MAGIC - `landing/landing/finance/payments/payments.json`
+# MAGIC - `landing/landing/finance/refunds/refunds.json`
+# MAGIC - `landing/landing/supply_chain/supplier_contracts/supplier_contracts.json`
+# MAGIC - `landing/landing/cdc/customers/cdc_customers_changes.json`
+# MAGIC - `landing/landing/cdc/products/cdc_products_changes.json`
+# MAGIC - `landing/landing/bad_data/poison_pills_orders.json`
+# MAGIC
+# MAGIC **Writes to:** `omnioc_dev.bronze.*_raw` via Autoloader trigger-once (batch mode)
 
 # COMMAND ----------
-from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, MapType
+# DBTITLE 1, Paths & Shared Config
 
-dbutils.widgets.text("catalog",         "omnioc_dev",       "Unity Catalog")
-dbutils.widgets.text("storage_account", "omniocdeveusst01", "ADLS Account")
-dbutils.widgets.text("trigger_once",    "true",             "trigger once?")
+# Container = "landing"
+# Files are inside the landing/landing/... subfolder
+LANDING = "abfss://landing@omniocdeveusst01.dfs.core.windows.net/landing"
+CHKPT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze"
 
-CATALOG         = dbutils.widgets.get("catalog")
-STORAGE_ACCOUNT = dbutils.widgets.get("storage_account")
-TRIGGER_ONCE    = dbutils.widgets.get("trigger_once").lower() == "true"
+# ── Autoloader options applied to every JSON source ───────────────────────────
+JSON_OPTIONS = {
+    # --- Format ---
+    "cloudFiles.format"             : "json",
 
-def adls(container, path=""):
-    return f"abfss://{container}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{path}"
+    # --- Schema handling ---
+    "cloudFiles.inferColumnTypes"   : "true",          # infer types (not everything as string)
+    "cloudFiles.schemaEvolutionMode": "addNewColumns",  # auto-add new fields from future files
+    # cloudFiles.schemaLocation set per table inside load_json()
 
-def trigger():
-    return {"once": True} if TRIGGER_ONCE else {"processingTime": "10 minutes"}
+    # --- Rescue ---
+    "cloudFiles.rescuedDataColumn"  : "_rescued_data", # any unparseable field stored here
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.bronze")
+    # --- Corruption handling ---
+    "columnNameOfCorruptRecord"     : "_corrupt_record",# store corrupt rows
+    "mode"                          : "PERMISSIVE",     # don't fail on bad rows
+}
+
+# JSON-lines (one object per line) — default, used for all finance/cdc/bad_data files
+JSONL_OPTIONS = {**JSON_OPTIONS, "multiLine": "false"}
+
+# Multi-line JSON (array in one file) — used for supplier_contracts
+MULTI_OPTIONS = {**JSON_OPTIONS, "multiLine": "true"}
+
+print("✅ Config ready")
+print(f"   LANDING : {LANDING}")
+print(f"   CHKPT   : {CHKPT}")
 
 # COMMAND ----------
-# MAGIC %md ## Shared helper
+from pyspark.sql.functions import current_timestamp, lit, input_file_name
 
-def autoloader_json(source_path, checkpoint_path, table,
-                    multi_line=False, extra_transforms=None):
-    opts = {
-        "cloudFiles.format":              "json",
-        "multiLine":                      str(multi_line).lower(),
-        "inferColumnTypes":               "true",
-        "cloudFiles.schemaLocation":      checkpoint_path + "_schema",
-        "cloudFiles.schemaEvolutionMode": "rescue",
-        "cloudFiles.includeExistingFiles":"true",
-    }
-    df = (
-        spark.readStream
+def load_json(source_path, target_table, multiline=False, extra_options=None):
+    """
+    Load JSON folder into a Delta bronze table using Autoloader (trigger once = batch mode).
+    Adds metadata cols: _ingest_time, _source_file, _source_system.
+
+    Args:
+        source_path  : full abfss path to folder (must end with /)
+        target_table : fully-qualified Delta table e.g. omnioc_dev.bronze.orders_raw
+        multiline    : True for multi-line JSON array files (supplier_contracts)
+        extra_options: additional cloudFiles options dict
+    """
+    table_name = target_table.split(".")[-1]
+    schema_loc = f"{CHKPT}/schema/{table_name}"    # Autoloader persists inferred schema here
+    chkpt_loc  = f"{CHKPT}/{table_name}"            # stream offset — tracks which files processed
+
+    base_opts = MULTI_OPTIONS if multiline else JSONL_OPTIONS
+    options   = {**base_opts, "cloudFiles.schemaLocation": schema_loc}
+    if extra_options:
+        options.update(extra_options)
+
+    print(f"  → Source    : {source_path}")
+    print(f"  → Multiline : {multiline}")
+    print(f"  → Schema    : {schema_loc}")
+    print(f"  → Checkpoint: {chkpt_loc}")
+
+    df = (spark.readStream
         .format("cloudFiles")
-        .options(**opts)
+        .options(**options)
         .load(source_path)
+        .withColumn("_ingest_time",   current_timestamp())
+        .withColumn("_source_file",   input_file_name())
+        .withColumn("_source_system", lit("adls_json"))
     )
-    if extra_transforms:
-        df = extra_transforms(df)
-    q = (
-        df
-        .withColumn("_source_file", F.input_file_name())
-        .withColumn("_ingest_time", F.current_timestamp())
-        .withColumn("_source",      F.lit(source_path))
-        .writeStream
+
+    (df.writeStream
         .format("delta")
         .outputMode("append")
-        .options(**{"checkpointLocation": checkpoint_path, "mergeSchema": "true"})
-        .trigger(**trigger())
-        .toTable(table)
-    )
-    q.awaitTermination()
-    count = spark.table(table).count()
-    print(f"✅ {table} | {count:,} rows")
-    return count
-
-# COMMAND ----------
-# MAGIC %md ## 1 — customers.json (JSON Lines)
-
-autoloader_json(
-    source_path     = adls("landing", "finance/customers.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/customers/"),
-    table           = f"{CATALOG}.bronze.customers_raw",
-    multi_line      = False,
-)
-
-# COMMAND ----------
-# MAGIC %md ## 2 — orders.json (JSON Lines)
-
-autoloader_json(
-    source_path     = adls("landing", "finance/orders.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/orders/"),
-    table           = f"{CATALOG}.bronze.orders_raw",
-    multi_line      = False,
-)
-
-# COMMAND ----------
-# MAGIC %md ## 3 — order_lines.json
-
-autoloader_json(
-    source_path     = adls("landing", "finance/order_lines.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/order_lines/"),
-    table           = f"{CATALOG}.bronze.order_lines_raw",
-    multi_line      = False,
-)
-
-# COMMAND ----------
-# MAGIC %md ## 4 — payments.json
-
-autoloader_json(
-    source_path     = adls("landing", "finance/payments.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/payments/"),
-    table           = f"{CATALOG}.bronze.payments_raw",
-    multi_line      = False,
-)
-
-# COMMAND ----------
-# MAGIC %md ## 5 — refunds.json
-
-autoloader_json(
-    source_path     = adls("landing", "finance/refunds.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/refunds/"),
-    table           = f"{CATALOG}.bronze.refunds_raw",
-    multi_line      = False,
-)
-
-# COMMAND ----------
-# MAGIC %md ## 6 — supplier_contracts.json (nested sla_terms struct → flatten)
-
-def flatten_contracts(df):
-    """Flatten nested sla_terms struct into individual columns."""
-    return (
-        df
-        .withColumn("sla_lead_time_days",              F.col("sla_terms.lead_time_days"))
-        .withColumn("sla_defect_rate_max_pct",         F.col("sla_terms.defect_rate_max_pct"))
-        .withColumn("sla_on_time_target_pct",          F.col("sla_terms.on_time_delivery_target_pct"))
-        .withColumn("sla_penalty_per_day_late_usd",    F.col("sla_terms.penalty_per_day_late_usd"))
-        .drop("sla_terms")
+        .option("checkpointLocation", chkpt_loc)
+        .option("mergeSchema",        "true")  # handles schema drift gracefully
+        .trigger(availableNow=True)            # batch mode: process all new files then stop
+        .toTable(target_table)
+        .awaitTermination()
     )
 
-autoloader_json(
-    source_path      = adls("landing", "supply_chain/supplier_contracts.json"),
-    checkpoint_path  = adls("checkpoint", "autoloader/supplier_contracts/"),
-    table            = f"{CATALOG}.bronze.supplier_contracts_raw",
-    multi_line       = True,
-    extra_transforms = flatten_contracts,
+    count = spark.table(target_table).count()
+    print(f"  ✅ {target_table} → {count:,} rows\n")
+
+# COMMAND ----------
+# MAGIC %md ## Finance Tables
+
+# COMMAND ----------
+# DBTITLE 1, customers_raw
+load_json(
+    source_path  = f"{LANDING}/finance/customers/",
+    target_table = "omnioc_dev.bronze.customers_raw",
 )
 
 # COMMAND ----------
-# MAGIC %md ## 7 — CDC change records
-
-# CDC customers
-autoloader_json(
-    source_path     = adls("landing", "cdc/cdc_customers_changes.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/cdc_customers/"),
-    table           = f"{CATALOG}.bronze.cdc_customers_raw",
-    multi_line      = False,
-)
-
-# CDC products
-autoloader_json(
-    source_path     = adls("landing", "cdc/cdc_products_changes.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/cdc_products/"),
-    table           = f"{CATALOG}.bronze.cdc_products_raw",
-    multi_line      = False,
+# DBTITLE 1, orders_raw
+load_json(
+    source_path  = f"{LANDING}/finance/orders/",
+    target_table = "omnioc_dev.bronze.orders_raw",
 )
 
 # COMMAND ----------
-# MAGIC %md ## 8 — Bad data / poison pills (DQ testing)
-
-autoloader_json(
-    source_path     = adls("landing", "bad_data/poison_pills_orders.json"),
-    checkpoint_path = adls("checkpoint", "autoloader/poison_pills/"),
-    table           = f"{CATALOG}.bronze.poison_pills_raw",
-    multi_line      = False,
+# DBTITLE 1, order_lines_raw
+load_json(
+    source_path  = f"{LANDING}/finance/order_lines/",
+    target_table = "omnioc_dev.bronze.order_lines_raw",
 )
 
 # COMMAND ----------
-# MAGIC %md ## Summary
+# DBTITLE 1, payments_raw
+load_json(
+    source_path  = f"{LANDING}/finance/payments/",
+    target_table = "omnioc_dev.bronze.payments_raw",
+)
 
-tables = [
-    "customers_raw", "orders_raw", "order_lines_raw", "payments_raw",
-    "refunds_raw", "supplier_contracts_raw",
-    "cdc_customers_raw", "cdc_products_raw", "poison_pills_raw",
-]
-print(f"\n{'Table':<50} {'Rows':>10}")
-print("─" * 63)
-for t in tables:
-    full = f"{CATALOG}.bronze.{t}"
-    try:
-        r = spark.table(full).count()
-        print(f"{full:<50} {r:>10,}")
-    except Exception as e:
-        print(f"{full:<50} ❌ {e}")
+# COMMAND ----------
+# DBTITLE 1, refunds_raw
+load_json(
+    source_path  = f"{LANDING}/finance/refunds/",
+    target_table = "omnioc_dev.bronze.refunds_raw",
+)
+
+# COMMAND ----------
+# MAGIC %md ## Supply Chain Tables
+
+# COMMAND ----------
+# DBTITLE 1, supplier_contracts_raw  (multiline=True — single JSON array file)
+load_json(
+    source_path  = f"{LANDING}/supply_chain/supplier_contracts/",
+    target_table = "omnioc_dev.bronze.supplier_contracts_raw",
+    multiline    = True,   # supplier_contracts.json is a JSON array, not JSON-lines
+)
+
+# COMMAND ----------
+# MAGIC %md ## CDC Tables
+
+# COMMAND ----------
+# DBTITLE 1, cdc_customers_raw
+load_json(
+    source_path  = f"{LANDING}/cdc/customers/",
+    target_table = "omnioc_dev.bronze.cdc_customers_raw",
+)
+
+# COMMAND ----------
+# DBTITLE 1, cdc_products_raw
+load_json(
+    source_path  = f"{LANDING}/cdc/products/",
+    target_table = "omnioc_dev.bronze.cdc_products_raw",
+)
+
+# COMMAND ----------
+# MAGIC %md ## Bad Data Table
+
+# COMMAND ----------
+# DBTITLE 1, poison_pills_raw
+load_json(
+    source_path  = f"{LANDING}/bad_data/",
+    target_table = "omnioc_dev.bronze.poison_pills_raw",
+)
+
+# COMMAND ----------
+# DBTITLE 1, Summary
+print("\n" + "="*65)
+print("  03 Bronze JSON — Load Summary")
+print("="*65)
+tables = {
+    "customers_raw"         : 10000,
+    "orders_raw"            : 100000,
+    "order_lines_raw"       : 50000,
+    "payments_raw"          : 40000,
+    "refunds_raw"           : 1000,
+    "supplier_contracts_raw": 400,
+    "cdc_customers_raw"     : 1000,
+    "cdc_products_raw"      : 200,
+    "poison_pills_raw"      : 100,
+}
+all_ok = True
+for tbl, expected in tables.items():
+    count  = spark.table(f"omnioc_dev.bronze.{tbl}").count()
+    status = "✅" if count >= expected else "⚠️ LOW"
+    if count == 0: status = "❌ EMPTY"; all_ok = False
+    print(f"  {status}  {tbl:<35} {count:>8,} rows  (expected ≥ {expected:,})")
+print("="*65)
+print(f"  {'✅ All tables loaded' if all_ok else '❌ Some tables empty — check paths above'}")
+print("="*65)
