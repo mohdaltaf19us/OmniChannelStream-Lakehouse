@@ -4,6 +4,7 @@
 # MAGIC Requires: com.microsoft.azure:azure-eventhubs-spark_2.12:2.3.22 installed on cluster
 
 # COMMAND ----------
+
 # DBTITLE 1, Config
 EH_CONN_STR  = dbutils.secrets.get('omnioc-kv-scope', 'eventhub-clickstream-connection-string')
 CHECKPOINT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze/clickstream_eh/"
@@ -12,7 +13,7 @@ EH_NAMESPACE = "omnioc-dev-eus-ehns-std-01"
 EH_TOPIC     = "eh-clickstream"
 
 # Encrypt connection string using Event Hubs utils
-encrypted = sc._jvm.org.apache.spark.eventhubs.EventHubsUtils.encrypt(EH_CONN_STR)
+encrypted = EH_CONN_STR
 
 ehConf = {
     'eventhubs.connectionString'     : encrypted,
@@ -27,6 +28,7 @@ print(f"   Topic     : {EH_TOPIC}")
 print(f"   Target    : {TARGET_TABLE}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Connect Stream
 raw_stream = (spark.readStream
     .format("eventhubs")
@@ -38,6 +40,7 @@ print("✅ Stream connected via Event Hubs native format")
 raw_stream.printSchema()
 
 # COMMAND ----------
+
 # DBTITLE 1, Define Schema
 from pyspark.sql.types import *
 from pyspark.sql.functions import *
@@ -69,6 +72,7 @@ clickstream_schema = StructType([
 print("✅ Schema defined — 21 fields")
 
 # COMMAND ----------
+
 # DBTITLE 1, Parse and Write to Delta
 parsed = (raw_stream
     .select(
@@ -106,6 +110,7 @@ print("   Trigger  : every 30 seconds")
 print("   Interrupt kernel (■) to stop")
 
 # COMMAND ----------
+
 # DBTITLE 1, Monitor Row Count
 import time
 for i in range(10):

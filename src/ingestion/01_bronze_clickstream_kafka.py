@@ -6,6 +6,7 @@
 # MAGIC - Target     : omnioc_dev.bronze.clickstream_raw_kafka
 
 # COMMAND ----------
+
 # DBTITLE 1, Config
 EH_CONN_STR  = dbutils.secrets.get('omnioc-kv-scope', 'eventhub-clickstream-connection-string')
 CHECKPOINT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze/clickstream_kafka/"
@@ -24,6 +25,7 @@ print(f"   Checkpoint : {CHECKPOINT}")
 print(f"   Target     : {TARGET_TABLE}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Connect Stream
 raw_stream = (spark.readStream
     .format("kafka")
@@ -44,6 +46,7 @@ print("✅ Stream connected via Kafka format")
 raw_stream.printSchema()
 
 # COMMAND ----------
+
 # DBTITLE 1, Define Schema
 from pyspark.sql.types import *
 from pyspark.sql.functions import *
@@ -75,6 +78,7 @@ clickstream_schema = StructType([
 print("✅ Schema defined — 21 fields")
 
 # COMMAND ----------
+
 # DBTITLE 1, Parse and Write to Delta
 parsed = (raw_stream
     .select(
@@ -109,9 +113,10 @@ print(f"   Checkpoint      : {CHECKPOINT}")
 print("   Interrupt kernel (■) to stop")
 
 # COMMAND ----------
+
 # DBTITLE 1, Monitor
 import time
-for i in range(10):
+for i in range(2):
     count = spark.table(TARGET_TABLE).count()
     print(f"  [{i*15}s] {TARGET_TABLE} → {count:,} rows")
     time.sleep(15)
