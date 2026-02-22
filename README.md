@@ -42,7 +42,7 @@ Everything lands in Bronze as-is, gets cleaned and conformed in Silver, and surf
    ADLS Gen2 landing/                        Event Hubs Kafka endpoint
    (batch files via ADF)                     (streaming into Databricks)
           │                                            │
-          └──────────────┬─────────────────────────────┘
+          └──────────────────┬─────────────────────────┘
                              │
                              ▼
               Databricks Bronze Layer
