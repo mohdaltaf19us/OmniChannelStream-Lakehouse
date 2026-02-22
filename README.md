@@ -31,11 +31,11 @@ Everything lands in Bronze as-is, gets cleaned and conformed in Silver, and surf
 ## Architecture
 
 ```
-Local Kafka / Event Producers
-          │
-          ▼
+                    Local Kafka / Event Producers
+                              │
+                              ▼
   Azure Event Hubs (eh-clickstream, device-telemetry, order-events)
-          │
+                              │
           ├────────────────────────────────────────────┐
           │                                            │
           ▼                                            ▼
