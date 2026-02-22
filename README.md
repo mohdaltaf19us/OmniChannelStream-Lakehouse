@@ -1,4 +1,4 @@
-# OmniOC Lakehouse
+# OmniChannelStream Lakehouse
 
 A production-grade Azure data engineering platform built from scratch — covering everything from raw event ingestion to analytical gold layer, with proper CI/CD, data quality contracts, and four distinct modelling approaches under one roof.
 
