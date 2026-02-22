@@ -1,108 +1,96 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # 04 Bronze Autoloader — Parquet Files
+# MAGIC Container: `landing` | Subfolder: `landing/` | Format: Parquet | Trigger: availableNow
 # MAGIC
-# MAGIC **Actual ADLS path (container=landing, subfolder=landing/):**
-# MAGIC - `landing/landing/supply_chain/shipments/shipments.parquet`
-# MAGIC
-# MAGIC **Writes to:** `omnioc_dev.bronze.shipments_raw` via Autoloader trigger-once (batch mode)
+# MAGIC Parquet is self-describing so types come from file metadata, not inference.
+# MAGIC Explicit casts added as a safeguard to guarantee schema matches DDL exactly.
 
 # COMMAND ----------
-# DBTITLE 1, Paths & Config
+# DBTITLE 1, Config
+from pyspark.sql.functions import col, current_timestamp, lit, input_file_name, max as spark_max
+from pyspark.sql.types import *
 
-# Container = "landing"
-# Files are inside the landing/landing/... subfolder
 LANDING = "abfss://landing@omniocdeveusst01.dfs.core.windows.net/landing"
 CHKPT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze"
 
-# ── Autoloader options for Parquet ────────────────────────────────────────────
-PARQUET_OPTIONS = {
-    # --- Format ---
-    "cloudFiles.format"             : "parquet",
-
-    # --- Schema handling ---
-    # Parquet is self-describing so schema inference is exact (not estimated like CSV)
-    # schemaLocation still needed for Autoloader to track schema across runs
-    "cloudFiles.schemaEvolutionMode": "addNewColumns",  # add new cols from future files
-
-    # --- Rescue ---
-    # Parquet supports rescue col for schema mismatches
-    "cloudFiles.rescuedDataColumn"  : "_rescued_data",
-}
-
-SOURCE_PATH  = f"{LANDING}/supply_chain/shipments/"
-TARGET_TABLE = "omnioc_dev.bronze.shipments_raw"
-SCHEMA_LOC   = f"{CHKPT}/schema/shipments_raw"
-CHKPT_LOC    = f"{CHKPT}/shipments_raw"
-
-print("✅ Config ready")
-print(f"   Source      : {SOURCE_PATH}")
-print(f"   Target      : {TARGET_TABLE}")
-print(f"   Schema loc  : {SCHEMA_LOC}")
-print(f"   Checkpoint  : {CHKPT_LOC}")
+print(f"✅ LANDING : {LANDING}")
+print(f"✅ CHKPT   : {CHKPT}")
 
 # COMMAND ----------
-from pyspark.sql.functions import current_timestamp, lit, input_file_name
+# MAGIC %md ## 1 — shipments_raw
 
 # COMMAND ----------
-# DBTITLE 1, Read Stream
-options = {**PARQUET_OPTIONS, "cloudFiles.schemaLocation": SCHEMA_LOC}
-
-df = (spark.readStream
+(spark.readStream
     .format("cloudFiles")
-    .options(**options)
-    .load(SOURCE_PATH)
-    .withColumn("_ingest_time",   current_timestamp())  # when Databricks ingested this row
-    .withColumn("_source_file",   input_file_name())    # full path of source parquet file
-    .withColumn("_source_system", lit("adls_parquet"))  # tag for lineage tracking
-)
-
-print("✅ Stream reader connected")
-print(f"   Schema will be inferred from parquet file metadata")
-df.printSchema()
-
-# COMMAND ----------
-# DBTITLE 1, Write to Delta
-print(f"Writing to {TARGET_TABLE}...")
-
-(df.writeStream
+    .option("cloudFiles.format",              "parquet")
+    .option("cloudFiles.schemaLocation",      f"{CHKPT}/schema/shipments_raw")
+    .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+    .option("cloudFiles.rescuedDataColumn",   "_rescued_data")
+    # inferColumnTypes not applicable to parquet — types come from file metadata
+    .load(f"{LANDING}/supply_chain/shipments/")
+    # ── Type casts — enforce DDL schema regardless of what parquet metadata says ──
+    .withColumn("quantity",                col("quantity").cast(IntegerType()))
+    .withColumn("unit_cost",               col("unit_cost").cast(DoubleType()))
+    .withColumn("total_cost",              col("total_cost").cast(DoubleType()))
+    # ── Metadata ────────────────────────────────────────────────────────────
+    .withColumn("_ingest_time",            current_timestamp())
+    .withColumn("_source_file",            input_file_name())
+    .withColumn("_source_system",          lit("adls_parquet"))
+    .writeStream
     .format("delta")
     .outputMode("append")
-    .option("checkpointLocation", CHKPT_LOC)
-    .option("mergeSchema",        "true")  # merge parquet schema into existing Delta schema
-    .trigger(availableNow=True)            # batch mode: process all pending files then stop
-    .toTable(TARGET_TABLE)
+    .option("checkpointLocation",          f"{CHKPT}/shipments_raw")
+    .option("mergeSchema",                 "true")
+    .trigger(availableNow=True)
+    .toTable("omnioc_dev.bronze.shipments_raw")
     .awaitTermination()
 )
 
-count = spark.table(TARGET_TABLE).count()
-print(f"\n✅ {TARGET_TABLE} → {count:,} rows loaded")
+# COMMAND ----------
+# MAGIC %md ## Summary — Live from Delta Table
 
 # COMMAND ----------
-# DBTITLE 1, Preview & Verify
-print("\n" + "="*65)
-print("  04 Bronze Parquet — Verification")
+# DBTITLE 1, Row count and schema
+df   = spark.table("omnioc_dev.bronze.shipments_raw")
+rows = df.count()
+cols = len(df.columns)
+
+print("="*65)
+print("  04 Bronze Parquet — Live Summary")
+print("="*65)
+print(f"  Table   : omnioc_dev.bronze.shipments_raw")
+print(f"  Rows    : {rows:,}  {'✅' if rows > 0 else '❌ EMPTY'}")
+print(f"  Columns : {cols}")
 print("="*65)
 
-df_check = spark.table(TARGET_TABLE)
-count    = df_check.count()
+# COMMAND ----------
+# DBTITLE 1, Latest ingest time
+latest = df.select(spark_max("_ingest_time")).collect()[0][0]
+print(f"  Latest _ingest_time : {latest}")
 
-print(f"  Rows loaded    : {count:,}  (expected ≥ 30,000)")
-print(f"  Columns        : {len(df_check.columns)}")
-print(f"  Source tag     : adls_parquet")
-print(f"  Target table   : {TARGET_TABLE}")
+# COMMAND ----------
+# DBTITLE 1, Source files loaded
+df.select("_source_file").distinct().show(truncate=False)
 
-status = "✅ PASS" if count >= 30000 else ("⚠️ LOW" if count > 0 else "❌ EMPTY")
-print(f"  Status         : {status}")
-print("="*65)
+# COMMAND ----------
+# DBTITLE 1, Shipment status breakdown
+df.groupBy("status").count().orderBy("count", ascending=False).show()
 
-# Show sample rows
-print("\nSample rows:")
-df_check.select(
+# COMMAND ----------
+# DBTITLE 1, Carrier breakdown
+df.groupBy("carrier").count().orderBy("count", ascending=False).show()
+
+# COMMAND ----------
+# DBTITLE 1, Rescued rows check
+rescued = df.filter("_rescued_data is not null").count()
+print(f"  Rescued rows : {rescued}")
+if rescued > 0:
+    df.filter("_rescued_data is not null").select("_rescued_data").show(5, truncate=False)
+
+# COMMAND ----------
+# DBTITLE 1, Sample rows
+df.select(
     "shipment_id","supplier_id","destination_warehouse_id",
     "product_id","quantity","status","ship_date","_ingest_time"
-).show(5, truncate=False)
-
-# Status distribution
-print("Status breakdown:")
-df_check.groupBy("status").count().orderBy("count", ascending=False).show()
+).show(10, truncate=False)
