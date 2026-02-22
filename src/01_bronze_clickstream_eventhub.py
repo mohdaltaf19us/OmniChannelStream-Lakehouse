@@ -1,159 +1,114 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 01 — Bronze: Clickstream Event Hubs → Delta
-# MAGIC **Source:** Azure Event Hubs `eh-clickstream` (consumer group `cg-dbx-stream`)
-# MAGIC **Sink:**   `omnioc_dev.bronze.clickstream_raw` (Delta Lake, append mode)
-# MAGIC **Pattern:** Structured Streaming · Micro-batch every 30 seconds · Checkpoint ensures exactly-once
+# MAGIC # Bronze Clickstream — Event Hubs Native Format (Requires Maven Library)
+# MAGIC Requires: com.microsoft.azure:azure-eventhubs-spark_2.12:2.3.22 installed on cluster
 
 # COMMAND ----------
-import json
-from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType,
-    BooleanType, IntegerType, TimestampType,
-)
+# DBTITLE 1, Config
+EH_CONN_STR  = dbutils.secrets.get('omnioc-kv-scope', 'eventhub-clickstream-connection-string')
+CHECKPOINT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze/clickstream_eh/"
+TARGET_TABLE = "omnioc_dev.bronze.clickstream_raw"
+EH_NAMESPACE = "omnioc-dev-eus-ehns-std-01"
+EH_TOPIC     = "eh-clickstream"
 
-# ── Widget parameters (set by DABs job, or manually in interactive) ──────────
-dbutils.widgets.text("catalog",          "omnioc_dev",            "Unity Catalog")
-dbutils.widgets.text("storage_account",  "omniocdeveusst01",      "ADLS Account")
-dbutils.widgets.text("secret_scope",     "omnioc-kv-scope",       "Databricks Secret Scope")
-dbutils.widgets.text("trigger_interval", "30 seconds",            "Streaming trigger interval")
-dbutils.widgets.text("eventhub_name",    "eh-clickstream",        "Event Hub name")
-dbutils.widgets.text("consumer_group",   "cg-dbx-stream",         "Consumer group")
+# Encrypt connection string using Event Hubs utils
+encrypted = sc._jvm.org.apache.spark.eventhubs.EventHubsUtils.encrypt(EH_CONN_STR)
 
-CATALOG          = dbutils.widgets.get("catalog")
-STORAGE_ACCOUNT  = dbutils.widgets.get("storage_account")
-SECRET_SCOPE     = dbutils.widgets.get("secret_scope")
-TRIGGER_INTERVAL = dbutils.widgets.get("trigger_interval")
-EH_NAME          = dbutils.widgets.get("eventhub_name")
-CONSUMER_GROUP   = dbutils.widgets.get("consumer_group")
-
-BRONZE_PATH      = f"abfss://bronze@{STORAGE_ACCOUNT}.dfs.core.windows.net/clickstream/"
-CHECKPOINT_PATH  = f"abfss://checkpoint@{STORAGE_ACCOUNT}.dfs.core.windows.net/clickstream_bronze/"
-TABLE            = f"{CATALOG}.bronze.clickstream_raw"
-
-print(f"Catalog       : {CATALOG}")
-print(f"Event Hub     : {EH_NAME} / {CONSUMER_GROUP}")
-print(f"Bronze path   : {BRONZE_PATH}")
-print(f"Checkpoint    : {CHECKPOINT_PATH}")
-print(f"Target table  : {TABLE}")
-
-# COMMAND ----------
-# MAGIC %md ## 1 — Create Bronze Schema
-
-spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.bronze")
-print(f"✅ {CATALOG}.bronze schema ready")
-
-# COMMAND ----------
-# MAGIC %md ## 2 — Event Hubs Connection
-
-connection_string = dbutils.secrets.get(
-    scope=SECRET_SCOPE,
-    key="eventhub-clickstream-connection-string"
-)
-eh_connection = f"{connection_string};EntityPath={EH_NAME}"
-
-eh_conf = {
-    "eventhubs.connectionString": sc._jvm.org.apache.spark.eventhubs \
-        .EventHubsUtils.encrypt(eh_connection),
-    "eventhubs.consumerGroup": CONSUMER_GROUP,
-    "eventhubs.startingPosition": json.dumps({
-        "offset": "@latest",
-        "seqNo": -1,
-        "enqueuedTime": None,
-        "isInclusive": True,
-    }),
-    "eventhubs.maxEventsPerTrigger": 500,
+ehConf = {
+    'eventhubs.connectionString'     : encrypted,
+    'eventhubs.consumerGroup'        : 'cg-dbx-stream',
+    'eventhubs.maxEventsPerTrigger'  : 500,
+    'eventhubs.startingPosition'     : '{"offset":"-1","seqNo":-1,"enqueuedTime":null,"isInclusive":true}',
 }
-print("✅ Event Hubs config ready")
+
+print("✅ Config ready")
+print(f"   Namespace : {EH_NAMESPACE}")
+print(f"   Topic     : {EH_TOPIC}")
+print(f"   Target    : {TARGET_TABLE}")
 
 # COMMAND ----------
-# MAGIC %md ## 3 — Clickstream Schema
-
-clickstream_schema = StructType([
-    StructField("event_id",           StringType(),  True),
-    StructField("event_type",         StringType(),  True),
-    StructField("session_id",         StringType(),  True),
-    StructField("user_id",            StringType(),  True),
-    StructField("device_type",        StringType(),  True),
-    StructField("event_time",         StringType(),  True),
-    StructField("processing_time",    StringType(),  True),
-    StructField("page_url",           StringType(),  True),
-    StructField("referrer_url",       StringType(),  True),
-    StructField("product_id",         StringType(),  True),
-    StructField("category",           StringType(),  True),
-    StructField("search_query",       StringType(),  True),
-    StructField("cart_value",         DoubleType(),  True),
-    StructField("purchase_amount",    DoubleType(),  True),
-    StructField("ip_address",         StringType(),  True),
-    StructField("user_agent",         StringType(),  True),
-    StructField("geo_country",        StringType(),  True),
-    StructField("geo_city",           StringType(),  True),
-    StructField("session_page_count", IntegerType(), True),
-    StructField("_is_late_arrival",   BooleanType(), True),
-    StructField("_is_poison_pill",    BooleanType(), True),
-])
-
-# COMMAND ----------
-# MAGIC %md ## 4 — Read → Parse → Write Stream
-
-raw_stream = (
-    spark.readStream
+# DBTITLE 1, Connect Stream
+raw_stream = (spark.readStream
     .format("eventhubs")
-    .options(**eh_conf)
+    .options(**ehConf)
     .load()
 )
 
-parsed_stream = (
-    raw_stream
-    .withColumn("body_str", F.col("body").cast("string"))
-    .withColumn("event",    F.from_json("body_str", clickstream_schema))
-    .select(
-        "event.*",
-        F.col("enqueuedTime").alias("eh_enqueued_time"),
-        F.col("offset").cast("string").alias("eh_offset"),
-        F.col("sequenceNumber").alias("eh_sequence_no"),
-        F.col("partitionId").alias("eh_partition_id"),
-    )
-    .withColumn("event_time",      F.to_timestamp("event_time"))
-    .withColumn("processing_time", F.to_timestamp("processing_time"))
-    .withColumn("_ingest_time",    F.current_timestamp())
-    .withColumn("_source",         F.lit(f"eventhubs/{EH_NAME}"))
-    .withColumn("_parse_failed",   F.col("event_id").isNull())
-    # Partition by date for efficient queries
-    .withColumn("_ingest_date",    F.to_date("_ingest_time"))
-)
-
-query = (
-    parsed_stream
-    .writeStream
-    .format("delta")
-    .outputMode("append")
-    .trigger(processingTime=TRIGGER_INTERVAL)
-    .option("checkpointLocation", CHECKPOINT_PATH)
-    .option("mergeSchema", "true")
-    .partitionBy("_ingest_date")
-    .toTable(TABLE)
-)
-
-print(f"✅ Stream started | Query ID: {query.id}")
-print(f"   Trigger : {TRIGGER_INTERVAL}")
-print(f"   Table   : {TABLE}")
-print(f"   Run query.stop() to stop the stream")
+print("✅ Stream connected via Event Hubs native format")
+raw_stream.printSchema()
 
 # COMMAND ----------
-# MAGIC %md ## 5 — Monitor (run while stream active)
+# DBTITLE 1, Define Schema
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
 
-# Uncomment to check stream status interactively
-# import time
-# for _ in range(10):
-#     if not query.isActive:
-#         print("Stream stopped")
-#         break
-#     prog = query.recentProgress
-#     if prog:
-#         p = prog[-1]
-#         print(f"Batch {p.get('batchId'):>4} | Rows: {p.get('numInputRows',0):>6,} | "
-#               f"Processing rate: {p.get('processedRowsPerSecond',0):.1f} rows/s")
-#     time.sleep(10)
+clickstream_schema = StructType([
+    StructField("event_id",            StringType()),
+    StructField("event_type",          StringType()),
+    StructField("session_id",          StringType()),
+    StructField("user_id",             StringType()),
+    StructField("device_type",         StringType()),
+    StructField("event_time",          StringType()),
+    StructField("processing_time",     StringType()),
+    StructField("page_url",            StringType()),
+    StructField("referrer_url",        StringType()),
+    StructField("product_id",          StringType()),
+    StructField("category",            StringType()),
+    StructField("search_query",        StringType()),
+    StructField("cart_value",          DoubleType()),
+    StructField("purchase_amount",     DoubleType()),
+    StructField("ip_address",          StringType()),
+    StructField("user_agent",          StringType()),
+    StructField("geo_country",         StringType()),
+    StructField("geo_city",            StringType()),
+    StructField("session_page_count",  IntegerType()),
+    StructField("_is_late_arrival",    BooleanType()),
+    StructField("_is_poison_pill",     BooleanType()),
+])
+
+print("✅ Schema defined — 21 fields")
+
+# COMMAND ----------
+# DBTITLE 1, Parse and Write to Delta
+parsed = (raw_stream
+    .select(
+        from_json(col("body").cast("string"), clickstream_schema).alias("d"),
+        col("enqueuedTime").alias("_eh_enqueued_time"),
+        col("partition").alias("_eh_partition"),
+        col("offset").alias("_eh_offset"),
+        col("sequenceNumber").alias("_eh_sequence"),
+        col("publisher").alias("_eh_publisher"),
+    )
+    .select(
+        "d.*",
+        "_eh_enqueued_time",
+        "_eh_partition",
+        "_eh_offset",
+        "_eh_sequence",
+        "_eh_publisher",
+        current_timestamp().alias("_ingest_time"),
+        lit("eventhubs_native").alias("_source_system"),
+    )
+)
+
+query = (parsed.writeStream
+    .format("delta")
+    .outputMode("append")
+    .option("checkpointLocation", CHECKPOINT)
+    .option("mergeSchema", "true")
+    .trigger(processingTime="30 seconds")
+    .toTable(TARGET_TABLE)
+)
+
+print(f"✅ Stream writing to {TARGET_TABLE}")
+print("   Format   : Event Hubs native")
+print("   Trigger  : every 30 seconds")
+print("   Interrupt kernel (■) to stop")
+
+# COMMAND ----------
+# DBTITLE 1, Monitor Row Count
+import time
+for i in range(10):
+    count = spark.table(TARGET_TABLE).count()
+    print(f"  [{i*15}s] {TARGET_TABLE} → {count} rows")
+    time.sleep(15)
