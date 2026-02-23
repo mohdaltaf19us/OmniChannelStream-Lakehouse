@@ -1,0 +1,25 @@
+{
+    "name": "ls_adls_omniocdeveusst01",
+    "type": "Microsoft.DataFactory/factories/linkedservices",
+    "properties": {
+        "description": "ADLS Gen2 storage account — omniocdeveusst01. Auth: ADF Managed Identity. Used for all landing/, bronze/, silver/, gold/, checkpoint/ containers.",
+        "type": "AzureBlobFS",
+        "typeProperties": {
+            "url": "https://omniocdeveusst01.dfs.core.windows.net/",
+            "accountKind": "StorageV2",
+            "credential": {
+                "referenceName": "AdfManagedIdentityCredential",
+                "type": "CredentialReference"
+            }
+        },
+        "connectVia": {
+            "referenceName": "AutoResolveIntegrationRuntime",
+            "type": "IntegrationRuntimeReference"
+        },
+        "annotations": [
+            "omnioc-lakehouse",
+            "adls-gen2",
+            "eastus"
+        ]
+    }
+}

@@ -1,0 +1,139 @@
+{
+    "name": "PL_10_Backfill",
+    "properties": {
+        "description": "Manual backfill pipeline — re-loads a date range for any source table.\n\n                   Use cases:\n                   - Source system had data quality issues for 3 days → backfill those dates\n                   - New column added to source → reload all history\n                   - Checkpoint corrupted → re-ingest from specific date\n\n                   Parameters:\n                   - backfill_start_date: 'YYYY-MM-DD' — first date to reload\n                   - backfill_end_date:   'YYYY-MM-DD' — last date to reload (inclusive)\n                   - target_table:        'orders' | 'customers' | 'all'\n                   - clear_checkpoint:    'true' → deletes Autoloader checkpoint (full re-read)\n                   - full_refresh_dlt:    'true' → full refresh DLT pipeline\n\n                   CAUTION: clear_checkpoint=true will re-read ALL files from landing/\n                   Typically you want clear_checkpoint=false and just re-upload the files.",
+        "activities": [
+            {
+                "name": "Validate Date Range",
+                "description": "Check start <= end and range is not more than 90 days.",
+                "type": "IfCondition",
+                "typeProperties": {
+                    "expression": {
+                        "value": "@and(lessOrEquals(pipeline().parameters.backfill_start_date, pipeline().parameters.backfill_end_date), lessOrEquals(div(sub(ticks(pipeline().parameters.backfill_end_date), ticks(pipeline().parameters.backfill_start_date)), 864000000000), 90))",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "Date Range Valid",
+                            "type": "SetVariable",
+                            "typeProperties": {
+                                "variableName": "validation_passed",
+                                "value": "true"
+                            }
+                        }
+                    ],
+                    "ifFalseActivities": [
+                        {
+                            "name": "Invalid Date Range",
+                            "type": "Fail",
+                            "typeProperties": {
+                                "message": {
+                                    "value": "@concat('Invalid date range: ', pipeline().parameters.backfill_start_date, ' to ', pipeline().parameters.backfill_end_date, '. Max 90 days per backfill run.')",
+                                    "type": "Expression"
+                                },
+                                "errorCode": "INVALID_DATE_RANGE"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "Re-Extract from SQL Server",
+                "description": "Re-extract source data for the backfill date range from SQL Server.",
+                "type": "Copy",
+                "dependsOn": [{ "activity": "Validate Date Range", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "sqlReaderQuery": {
+                            "value": "@concat('SELECT * FROM dbo.', pipeline().parameters.target_table, ' WHERE updated_at >= ''', pipeline().parameters.backfill_start_date, ''' AND updated_at <= ''', pipeline().parameters.backfill_end_date, ' 23:59:59''')",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "04:00:00"
+                    },
+                    "sink": {
+                        "type": "ParquetSink",
+                        "storeSettings": {
+                            "type": "AzureBlobFSWriteSettings",
+                            "copyBehavior": "MergeFiles"
+                        }
+                    }
+                },
+                "inputs": [{
+                    "referenceName": "DS_SqlServer_Table",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "schema_name": "dbo",
+                        "table_name":  { "value": "@pipeline().parameters.target_table", "type": "Expression" }
+                    }
+                }],
+                "outputs": [{
+                    "referenceName": "DS_ADLS_Parquet",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "container":   "landing",
+                        "folder_path": {
+                            "value": "@concat('backfill/', pipeline().parameters.target_table, '/', pipeline().parameters.backfill_start_date, '_to_', pipeline().parameters.backfill_end_date)",
+                            "type": "Expression"
+                        },
+                        "file_name":   {
+                            "value": "@concat(pipeline().parameters.target_table, '_backfill.parquet')",
+                            "type": "Expression"
+                        }
+                    }
+                }]
+            },
+            {
+                "name": "Run Databricks Backfill Notebook",
+                "description": "Run Bronze Autoloader for the backfill path, then re-run Silver DLT with full_refresh=true.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Re-Extract from SQL Server", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/maintenance/backfill_notebook",
+                    "baseParameters": {
+                        "target_table":       { "value": "@pipeline().parameters.target_table",      "type": "Expression" },
+                        "backfill_start":     { "value": "@pipeline().parameters.backfill_start_date", "type": "Expression" },
+                        "backfill_end":       { "value": "@pipeline().parameters.backfill_end_date",   "type": "Expression" },
+                        "clear_checkpoint":   { "value": "@pipeline().parameters.clear_checkpoint",    "type": "Expression" },
+                        "full_refresh_dlt":   { "value": "@pipeline().parameters.full_refresh_dlt",    "type": "Expression" },
+                        "catalog":            { "value": "@pipeline().parameters.catalog",             "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Backfill Complete Alert",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Run Databricks Backfill Notebook", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "pipeline": { "referenceName": "PL_07_Alerting", "type": "PipelineReference" },
+                    "waitOnCompletion": false,
+                    "parameters": {
+                        "pipeline_name": "PL_10_Backfill",
+                        "failure_reason": "",
+                        "run_id":        {
+                            "value": "@concat(pipeline().parameters.target_table, '_', pipeline().parameters.backfill_start_date, '_to_', pipeline().parameters.backfill_end_date)",
+                            "type": "Expression"
+                        },
+                        "severity": "SUCCESS"
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "backfill_start_date": { "type": "String" },
+            "backfill_end_date":   { "type": "String" },
+            "target_table":        { "type": "String", "defaultValue": "orders" },
+            "catalog":             { "type": "String", "defaultValue": "omnioc_dev" },
+            "clear_checkpoint":    { "type": "String", "defaultValue": "false" },
+            "full_refresh_dlt":    { "type": "String", "defaultValue": "false" }
+        },
+        "variables": {
+            "validation_passed": { "type": "String", "defaultValue": "false" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:backfill", "manual-trigger-only"]
+    }
+}

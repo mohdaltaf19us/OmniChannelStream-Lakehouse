@@ -1,0 +1,36 @@
+{
+    "name": "ds_sqlserver_table",
+    "type": "Microsoft.DataFactory/factories/datasets",
+    "properties": {
+        "description": "Generic parameterized SQL Server table dataset. Pass schemaName and tableName at runtime from the metadata config table.",
+        "linkedServiceName": {
+            "referenceName": "ls_sqlserver_omnioc",
+            "type": "LinkedServiceReference"
+        },
+        "parameters": {
+            "schemaName": {
+                "type": "String",
+                "defaultValue": "dbo"
+            },
+            "tableName": {
+                "type": "String"
+            },
+            "watermarkColumn": {
+                "type": "String",
+                "defaultValue": "updated_at"
+            }
+        },
+        "type": "SqlServerTable",
+        "schema": [],
+        "typeProperties": {
+            "schema": {
+                "value": "@dataset().schemaName",
+                "type": "Expression"
+            },
+            "table": {
+                "value": "@dataset().tableName",
+                "type": "Expression"
+            }
+        }
+    }
+}

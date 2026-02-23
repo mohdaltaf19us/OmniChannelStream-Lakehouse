@@ -1,0 +1,40 @@
+resources:
+  pipelines:
+    clickstream_dlt:
+      name: omnioc-${var.env}-clickstream-dlt
+      target: ${var.catalog}.silver
+      catalog: ${var.catalog}
+
+      configuration:
+        catalog: ${var.catalog}
+        storage_account: ${var.storage_account}
+        env: ${var.env}
+        eventhub_namespace: ${var.eventhub_namespace}
+        secret_scope: ${var.secret_scope}
+        pipelines.trigger.interval: "30 seconds"
+
+      libraries:
+        - notebook:
+            path: /Workspace/OmniOC/${bundle.target}/src/dlt_pipelines/clickstream_dlt.py
+
+      clusters:
+        - label: default
+          node_type_id: ${var.node_type}
+          num_workers: 2
+          spark_conf:
+            spark.databricks.io.cache.enabled: "true"
+            spark.databricks.delta.optimizeWrite.enabled: "true"
+          custom_tags:
+            project: omnioc-lakehouse
+            env: ${var.env}
+
+      # Clickstream runs continuous for real-time latency
+      continuous: true
+      development: ${bundle.target == 'dev'}
+      channel: "CURRENT"
+
+      notifications:
+        - email_recipients:
+            - data-eng@omnioc.com
+          alerts:
+            - on-update-failure

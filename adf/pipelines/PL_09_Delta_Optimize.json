@@ -1,0 +1,83 @@
+{
+    "name": "PL_09_Delta_Optimize",
+    "properties": {
+        "description": "Weekly Delta Lake maintenance — OPTIMIZE + Z-ORDER + VACUUM.\n\n                   Runs: Sunday 03:00 UTC (off-peak — no active pipelines)\n\n                   Tables optimised (in order of importance):\n                   - gold.*          → OPTIMIZE + Z-ORDER by most common filter cols\n                   - silver.*        → OPTIMIZE (no Z-ORDER — DLT manages these)\n                   - bronze.*        → OPTIMIZE only (high churn, frequent appends)\n\n                   VACUUM policy: 168-hour retention (7 days) — Delta default is 168h.\n                   Do NOT reduce below 168h — breaks time travel and streaming checkpoints.\n\n                   Each OPTIMIZE runs as a separate DatabricksNotebook activity\n                   so one failure doesn't block all others.",
+        "activities": [
+            {
+                "name": "Optimize Gold Tables",
+                "description": "OPTIMIZE + Z-ORDER Gold tables — most impactful for dashboard performance.",
+                "type": "DatabricksNotebook",
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/maintenance/delta_optimize",
+                    "baseParameters": {
+                        "catalog":  { "value": "@pipeline().parameters.catalog", "type": "Expression" },
+                        "layer":    "gold",
+                        "vacuum":   "true",
+                        "retention_hours": "168"
+                    }
+                }
+            },
+            {
+                "name": "Optimize Silver Tables",
+                "description": "OPTIMIZE Silver tables — DLT-managed, no Z-ORDER (DLT handles layout).",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Optimize Gold Tables", "dependencyConditions": ["Succeeded", "Failed"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/maintenance/delta_optimize",
+                    "baseParameters": {
+                        "catalog": { "value": "@pipeline().parameters.catalog", "type": "Expression" },
+                        "layer":   "silver",
+                        "vacuum":  "true",
+                        "retention_hours": "168"
+                    }
+                }
+            },
+            {
+                "name": "Optimize Bronze Tables",
+                "description": "OPTIMIZE Bronze tables — high file count from streaming appends.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Optimize Silver Tables", "dependencyConditions": ["Succeeded", "Failed"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/maintenance/delta_optimize",
+                    "baseParameters": {
+                        "catalog": { "value": "@pipeline().parameters.catalog", "type": "Expression" },
+                        "layer":   "bronze",
+                        "vacuum":  "false",
+                        "retention_hours": "168"
+                    }
+                }
+            },
+            {
+                "name": "Alert Optimize Complete",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Optimize Bronze Tables", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "pipeline": { "referenceName": "PL_07_Alerting", "type": "PipelineReference" },
+                    "waitOnCompletion": false,
+                    "parameters": {
+                        "pipeline_name": "PL_09_Delta_Optimize",
+                        "failure_reason": "",
+                        "run_id":         { "value": "@utcNow()", "type": "Expression" },
+                        "severity":       "SUCCESS"
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "catalog": { "type": "String", "defaultValue": "omnioc_dev" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:maintenance"]
+    }
+}

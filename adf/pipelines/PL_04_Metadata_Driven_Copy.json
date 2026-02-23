@@ -1,0 +1,193 @@
+{
+    "name": "PL_04_Metadata_Driven_Copy",
+    "properties": {
+        "description": "Metadata-driven copy pipeline — reads table configuration from a SQL control table.\n                   Adding a new source table requires ONLY a new row in the control table — no pipeline changes.\n\n                   Control table: dbo.adf_copy_config\n                   DDL (run on SQL Server):\n                   CREATE TABLE dbo.adf_copy_config (\n                       config_id       INT IDENTITY PRIMARY KEY,\n                       source_type     VARCHAR(20)  NOT NULL,  -- 'sqlserver', 'blob', 'http'\n                       source_schema   VARCHAR(50),\n                       source_table    VARCHAR(100) NOT NULL,\n                       load_type       VARCHAR(20)  NOT NULL,  -- 'full', 'incremental'\n                       watermark_col   VARCHAR(100),\n                       target_domain   VARCHAR(50)  NOT NULL,\n                       target_format   VARCHAR(20)  NOT NULL DEFAULT 'parquet',  -- 'parquet','json','csv'\n                       is_active       BIT          NOT NULL DEFAULT 1,\n                       priority        INT          NOT NULL DEFAULT 100,\n                       last_run_status VARCHAR(20),\n                       notes           NVARCHAR(500)\n                   );\n\n                   This pattern proves: metadata-driven architecture (senior DE skill).",
+        "activities": [
+            {
+                "name": "Lookup Active Config",
+                "description": "Read all active source tables from control table, ordered by priority.",
+                "type": "Lookup",
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "sqlReaderQuery": "SELECT config_id, source_type, source_schema, source_table, load_type, watermark_col, target_domain, target_format FROM dbo.adf_copy_config WHERE is_active = 1 ORDER BY priority ASC"
+                    },
+                    "dataset": {
+                        "referenceName": "DS_SqlServer_Watermark",
+                        "type": "DatasetReference"
+                    },
+                    "firstRowOnly": false
+                }
+            },
+            {
+                "name": "ForEach Source Table",
+                "description": "Process each configured source. Max 4 parallel to avoid SQL Server connection saturation.",
+                "type": "ForEach",
+                "dependsOn": [{ "activity": "Lookup Active Config", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('Lookup Active Config').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": false,
+                    "batchCount": 4,
+                    "activities": [
+                        {
+                            "name": "Route by Load Type",
+                            "description": "Route to correct copy strategy based on load_type column.",
+                            "type": "Switch",
+                            "typeProperties": {
+                                "on": {
+                                    "value": "@item().load_type",
+                                    "type": "Expression"
+                                },
+                                "cases": [
+                                    {
+                                        "value": "full",
+                                        "activities": [
+                                            {
+                                                "name": "Full Copy",
+                                                "type": "Copy",
+                                                "typeProperties": {
+                                                    "source": {
+                                                        "type": "SqlServerSource",
+                                                        "sqlReaderQuery": {
+                                                            "value": "@concat('SELECT * FROM ', item().source_schema, '.', item().source_table)",
+                                                            "type": "Expression"
+                                                        }
+                                                    },
+                                                    "sink": {
+                                                        "type": "ParquetSink",
+                                                        "storeSettings": { "type": "AzureBlobFSWriteSettings", "copyBehavior": "MergeFiles" }
+                                                    }
+                                                },
+                                                "inputs": [{
+                                                    "referenceName": "DS_SqlServer_Table",
+                                                    "type": "DatasetReference",
+                                                    "parameters": {
+                                                        "schema_name": { "value": "@item().source_schema", "type": "Expression" },
+                                                        "table_name":  { "value": "@item().source_table",  "type": "Expression" }
+                                                    }
+                                                }],
+                                                "outputs": [{
+                                                    "referenceName": "DS_ADLS_Parquet",
+                                                    "type": "DatasetReference",
+                                                    "parameters": {
+                                                        "container": "landing",
+                                                        "folder_path": {
+                                                            "value": "@concat(item().target_domain, '/', item().source_table, '/', formatDateTime(utcNow(), 'yyyy-MM-dd'))",
+                                                            "type": "Expression"
+                                                        },
+                                                        "file_name": {
+                                                            "value": "@concat(item().source_table, '_full.parquet')",
+                                                            "type": "Expression"
+                                                        }
+                                                    }
+                                                }]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "value": "incremental",
+                                        "activities": [
+                                            {
+                                                "name": "Lookup Watermark for Table",
+                                                "type": "Lookup",
+                                                "typeProperties": {
+                                                    "source": {
+                                                        "type": "SqlServerSource",
+                                                        "sqlReaderQuery": {
+                                                            "value": "@concat('SELECT last_loaded_at FROM dbo.adf_watermark_control WHERE source_schema=''', item().source_schema, ''' AND source_table=''', item().source_table, '''')",
+                                                            "type": "Expression"
+                                                        }
+                                                    },
+                                                    "dataset": { "referenceName": "DS_SqlServer_Watermark", "type": "DatasetReference" },
+                                                    "firstRowOnly": true
+                                                }
+                                            },
+                                            {
+                                                "name": "Incremental Copy",
+                                                "type": "Copy",
+                                                "dependsOn": [{ "activity": "Lookup Watermark for Table", "dependencyConditions": ["Succeeded"] }],
+                                                "typeProperties": {
+                                                    "source": {
+                                                        "type": "SqlServerSource",
+                                                        "sqlReaderQuery": {
+                                                            "value": "@concat('SELECT * FROM ', item().source_schema, '.', item().source_table, ' WHERE ', item().watermark_col, ' > ''', activity('Lookup Watermark for Table').output.firstRow.last_loaded_at, '''')",
+                                                            "type": "Expression"
+                                                        }
+                                                    },
+                                                    "sink": {
+                                                        "type": "ParquetSink",
+                                                        "storeSettings": { "type": "AzureBlobFSWriteSettings", "copyBehavior": "MergeFiles" }
+                                                    }
+                                                },
+                                                "inputs": [{
+                                                    "referenceName": "DS_SqlServer_Table",
+                                                    "type": "DatasetReference",
+                                                    "parameters": {
+                                                        "schema_name": { "value": "@item().source_schema", "type": "Expression" },
+                                                        "table_name":  { "value": "@item().source_table",  "type": "Expression" }
+                                                    }
+                                                }],
+                                                "outputs": [{
+                                                    "referenceName": "DS_ADLS_Parquet",
+                                                    "type": "DatasetReference",
+                                                    "parameters": {
+                                                        "container": "landing",
+                                                        "folder_path": {
+                                                            "value": "@concat(item().target_domain, '/', item().source_table, '/', formatDateTime(utcNow(), 'yyyy-MM-dd'))",
+                                                            "type": "Expression"
+                                                        },
+                                                        "file_name": {
+                                                            "value": "@concat(item().source_table, '_incr_', formatDateTime(utcNow(), 'HHmmss'), '.parquet')",
+                                                            "type": "Expression"
+                                                        }
+                                                    }
+                                                }]
+                                            }
+                                        ]
+                                    }
+                                ],
+                                "defaultActivities": [
+                                    {
+                                        "name": "Unknown Load Type",
+                                        "type": "Fail",
+                                        "typeProperties": {
+                                            "message": {
+                                                "value": "@concat('Unknown load_type: ', item().load_type, ' for table: ', item().source_table)",
+                                                "type": "Expression"
+                                            },
+                                            "errorCode": "UNKNOWN_LOAD_TYPE"
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "name": "Update Config Run Status",
+                            "description": "Update last_run_status in control table after each table completes.",
+                            "type": "SqlServerStoredProcedure",
+                            "dependsOn": [{ "activity": "Route by Load Type", "dependencyConditions": ["Succeeded", "Failed", "Skipped"] }],
+                            "linkedServiceName": {
+                                "referenceName": "LS_SqlServer_OnPrem",
+                                "type": "LinkedServiceReference"
+                            },
+                            "typeProperties": {
+                                "storedProcedureName": "dbo.usp_update_copy_config_status",
+                                "storedProcedureParameters": {
+                                    "config_id": { "value": { "value": "@string(item().config_id)", "type": "Expression" }, "type": "String" },
+                                    "status":    { "value": { "value": "@activity('Route by Load Type').Status",           "type": "Expression" }, "type": "String" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "run_id": { "type": "String" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:metadata-driven"]
+    }
+}

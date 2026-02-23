@@ -1,0 +1,43 @@
+{
+    "name": "ds_adls_parquet_landing",
+    "type": "Microsoft.DataFactory/factories/datasets",
+    "properties": {
+        "description": "Generic ADLS Gen2 Parquet sink — lands in landing/{folderPath}/{fileName}. Container, folder and file name are all parameterized so one dataset handles any table.",
+        "linkedServiceName": {
+            "referenceName": "ls_adls_omniocdeveusst01",
+            "type": "LinkedServiceReference"
+        },
+        "parameters": {
+            "containerName": {
+                "type": "String",
+                "defaultValue": "landing"
+            },
+            "folderPath": {
+                "type": "String"
+            },
+            "fileName": {
+                "type": "String"
+            }
+        },
+        "type": "Parquet",
+        "typeProperties": {
+            "location": {
+                "type": "AzureBlobFSLocation",
+                "fileSystem": {
+                    "value": "@dataset().containerName",
+                    "type": "Expression"
+                },
+                "folderPath": {
+                    "value": "@dataset().folderPath",
+                    "type": "Expression"
+                },
+                "fileName": {
+                    "value": "@dataset().fileName",
+                    "type": "Expression"
+                }
+            },
+            "compressionCodec": "snappy"
+        },
+        "schema": []
+    }
+}

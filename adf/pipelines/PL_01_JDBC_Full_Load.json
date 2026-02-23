@@ -1,0 +1,110 @@
+{
+    "name": "PL_01_JDBC_Full_Load",
+    "properties": {
+        "description": "Full reload of small/static dimension tables from SQL Server.\n                   Tables: warehouses, suppliers, products (full snap — no watermark needed).\n                   Writes to: ADLS landing/{domain}/{table}/{date}/\n                   Format: Parquet (columnar, efficient for Autoloader)\n\n                   Pattern: ForEach over table config array → Copy Activity\n                   ADF ForEach limitation: NOT nested — tables are in a flat array.",
+        "activities": [
+            {
+                "name": "ForEach Full Load Table",
+                "type": "ForEach",
+                "typeProperties": {
+                    "items": {
+                        "value": "@pipeline().parameters.tables_config",
+                        "type": "Expression"
+                    },
+                    "isSequential": false,
+                    "batchCount": 3,
+                    "activities": [
+                        {
+                            "name": "Copy Table to Landing",
+                            "description": "Copy one table from SQL Server → ADLS landing as Parquet.\n                              Output path: landing/{domain}/{table_name}/{landing_date}/data.parquet",
+                            "type": "Copy",
+                            "typeProperties": {
+                                "source": {
+                                    "type": "SqlServerSource",
+                                    "sqlReaderQuery": {
+                                        "value": "@concat('SELECT * FROM ', item().schema_name, '.', item().table_name)",
+                                        "type": "Expression"
+                                    },
+                                    "queryTimeout": "02:00:00",
+                                    "partitionOption": "None"
+                                },
+                                "sink": {
+                                    "type": "ParquetSink",
+                                    "storeSettings": {
+                                        "type": "AzureBlobFSWriteSettings",
+                                        "copyBehavior": "MergeFiles"
+                                    },
+                                    "formatSettings": {
+                                        "type": "ParquetWriteSettings"
+                                    }
+                                },
+                                "enableStaging": false,
+                                "translator": { "type": "TabularTranslator", "typeConversion": true },
+                                "logSettings": {
+                                    "enableCopyActivityLog": true,
+                                    "copyActivityLogSettings": { "logLevel": "Warning" },
+                                    "logLocationSettings": {
+                                        "linkedServiceName": { "referenceName": "LS_ADLS_Gen2", "type": "LinkedServiceReference" },
+                                        "path": "checkpoint/adf-logs/full-load"
+                                    }
+                                }
+                            },
+                            "inputs": [{
+                                "referenceName": "DS_SqlServer_Table",
+                                "type": "DatasetReference",
+                                "parameters": {
+                                    "schema_name": { "value": "@item().schema_name", "type": "Expression" },
+                                    "table_name":  { "value": "@item().table_name",  "type": "Expression" }
+                                }
+                            }],
+                            "outputs": [{
+                                "referenceName": "DS_ADLS_Parquet",
+                                "type": "DatasetReference",
+                                "parameters": {
+                                    "container":   "landing",
+                                    "folder_path": {
+                                        "value": "@concat(item().domain, '/', item().table_name, '/', pipeline().parameters.landing_date)",
+                                        "type": "Expression"
+                                    },
+                                    "file_name":   {
+                                        "value": "@concat(item().table_name, '_full.parquet')",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }]
+                        },
+                        {
+                            "name": "Log Copy Result",
+                            "description": "Append copy metrics to pipeline log variable",
+                            "type": "AppendVariable",
+                            "dependsOn": [{ "activity": "Copy Table to Landing", "dependencyConditions": ["Succeeded"] }],
+                            "typeProperties": {
+                                "variableName": "copy_log",
+                                "value": {
+                                    "value": "@concat(item().table_name, ': ', string(activity('Copy Table to Landing').output.rowsCopied), ' rows')",
+                                    "type": "Expression"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "run_id":       { "type": "String" },
+            "landing_date": { "type": "String" },
+            "tables_config": {
+                "type": "Array",
+                "defaultValue": [
+                    { "schema_name": "dbo", "table_name": "warehouses",  "domain": "supply_chain" },
+                    { "schema_name": "dbo", "table_name": "suppliers",   "domain": "supply_chain" },
+                    { "schema_name": "dbo", "table_name": "products",    "domain": "supply_chain" }
+                ]
+            }
+        },
+        "variables": {
+            "copy_log": { "type": "Array" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:full-load"]
+    }
+}

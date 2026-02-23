@@ -1,0 +1,106 @@
+table: omnioc_dev.silver.orders
+version: "1.2"
+owner: finance_team
+contact: finance-data@omnioc.com
+description: "Cleansed, deduplicated orders from all channels. CDC-merged from SQL Server + batch JSON drops."
+update_frequency: daily
+sla_freshness_hours: 25
+
+columns:
+  - name: order_id
+    type: STRING
+    nullable: false
+    description: "Natural key — format ORD-XXXXXXXX"
+
+  - name: customer_id
+    type: STRING
+    nullable: false
+    references: omnioc_dev.silver.customers.customer_id
+
+  - name: warehouse_id
+    type: STRING
+    nullable: true
+    references: omnioc_dev.bronze.warehouses_raw.warehouse_id
+
+  - name: order_date
+    type: TIMESTAMP
+    nullable: false
+    constraints:
+      min: "2020-01-01"
+      not_future: true
+
+  - name: status
+    type: STRING
+    nullable: false
+    constraints:
+      allowed_values:
+        - placed
+        - confirmed
+        - processing
+        - shipped
+        - delivered
+        - cancelled
+        - returned
+
+  - name: channel
+    type: STRING
+    nullable: true
+    constraints:
+      allowed_values: [web, mobile_app, marketplace, in_store, api]
+
+  - name: total_amount
+    type: DOUBLE
+    nullable: false
+    constraints:
+      min: 0.01
+      max: 999999.99
+
+  - name: discount_amount
+    type: DOUBLE
+    nullable: true
+    constraints:
+      min: 0.0
+
+  - name: tax_amount
+    type: DOUBLE
+    nullable: true
+    constraints:
+      min: 0.0
+
+  - name: shipping_amount
+    type: DOUBLE
+    nullable: true
+    constraints:
+      min: 0.0
+
+  - name: currency
+    type: STRING
+    nullable: false
+    constraints:
+      allowed_values: [USD, EUR, GBP, AUD, CAD, JPY, SGD, INR, BRL, SGD]
+
+  - name: updated_at
+    type: TIMESTAMP
+    nullable: false
+
+quality_rules:
+  - rule: no_negative_revenue
+    expression: "total_amount >= 0 AND (discount_amount IS NULL OR discount_amount >= 0)"
+    severity: CRITICAL
+
+  - rule: discount_not_exceed_total
+    expression: "discount_amount IS NULL OR discount_amount <= total_amount"
+    severity: HIGH
+
+  - rule: valid_status_transitions
+    description: "Cancelled or returned orders should not have delivery_date"
+    expression: "NOT (status IN ('cancelled', 'returned') AND delivery_date IS NOT NULL)"
+    severity: MEDIUM
+
+partition_columns:
+  - order_date  # partitioned by date for efficient range queries
+
+delta_properties:
+  enableChangeDataFeed: true
+  autoOptimize.optimizeWrite: true
+  autoOptimize.autoCompact: true

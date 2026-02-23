@@ -1,0 +1,306 @@
+{
+    "name": "pl_master_orchestrator",
+    "type": "Microsoft.DataFactory/factories/pipelines",
+    "properties": {
+        "description": "Master daily orchestration pipeline. Sequences: SQL Server ingest → CDC extract → FX rates → trigger Databricks batch job → monitor Bronze freshness. Triggered daily at 01:00 UTC by tr_daily_batch.",
+        "activities": [
+            {
+                "name": "CheckPreviousDaySuccess",
+                "description": "Look up last successful run from audit log before proceeding",
+                "type": "Lookup",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:02:00",
+                    "retry": 1,
+                    "retryIntervalInSeconds": 30
+                },
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": {
+                            "value": "SELECT TOP 1 run_date, status, rows_copied\nFROM [dbo].[adf_pipeline_audit]\nWHERE pipeline_name = 'pl_master_orchestrator'\n  AND status = 'Success'\nORDER BY run_date DESC",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "00:01:00"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sqlserver_table",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "schemaName": "dbo",
+                            "tableName": "adf_pipeline_audit"
+                        }
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "LogRunStart",
+                "description": "Write run_start record to audit log",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [
+                    {
+                        "activity": "CheckPreviousDaySuccess",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls_sqlserver_omnioc",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[usp_adf_log_run]",
+                    "storedProcedureParameters": {
+                        "pipelineName": {
+                            "value": "pl_master_orchestrator",
+                            "type": "String"
+                        },
+                        "runId": {
+                            "value": {
+                                "value": "@pipeline().RunId",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "status": {
+                            "value": "Running",
+                            "type": "String"
+                        },
+                        "triggeredBy": {
+                            "value": {
+                                "value": "@pipeline().TriggerName",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        }
+                    }
+                }
+            },
+
+            {
+                "name": "IngestSQLServerToADLS",
+                "description": "Execute child pipeline: full + incremental SQL Server tables → ADLS landing",
+                "type": "ExecutePipeline",
+                "dependsOn": [
+                    {
+                        "activity": "LogRunStart",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "pipeline": {
+                        "referenceName": "pl_ingest_sqlserver_to_adls",
+                        "type": "PipelineReference"
+                    },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "pipelineRunDate": {
+                            "value": "@formatDateTime(pipeline().TriggerTime, 'yyyy-MM-dd')",
+                            "type": "Expression"
+                        },
+                        "loadType": "incremental"
+                    }
+                }
+            },
+            {
+                "name": "ExtractCDCChanges",
+                "description": "Execute child pipeline: CDC incremental change extraction from SQL Server",
+                "type": "ExecutePipeline",
+                "dependsOn": [
+                    {
+                        "activity": "IngestSQLServerToADLS",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "pipeline": {
+                        "referenceName": "pl_cdc_extract",
+                        "type": "PipelineReference"
+                    },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "extractDate": {
+                            "value": "@formatDateTime(pipeline().TriggerTime, 'yyyy-MM-dd')",
+                            "type": "Expression"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "FetchExchangeRates",
+                "description": "Execute child pipeline: pull latest FX rates from API → ADLS",
+                "type": "ExecutePipeline",
+                "dependsOn": [
+                    {
+                        "activity": "LogRunStart",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "pipeline": {
+                        "referenceName": "pl_exchange_rate_api",
+                        "type": "PipelineReference"
+                    },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "rateDate": {
+                            "value": "@formatDateTime(pipeline().TriggerTime, 'yyyy-MM-dd')",
+                            "type": "Expression"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "WaitForIngestion",
+                "description": "Gate: both SQL ingest and FX rates must succeed before triggering Databricks",
+                "type": "Wait",
+                "dependsOn": [
+                    {
+                        "activity": "ExtractCDCChanges",
+                        "dependencyConditions": ["Succeeded"]
+                    },
+                    {
+                        "activity": "FetchExchangeRates",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "waitTimeInSeconds": 5
+                }
+            },
+            {
+                "name": "TriggerDatabricksBatch",
+                "description": "Execute child pipeline: trigger Databricks batch ingestion job and wait for completion",
+                "type": "ExecutePipeline",
+                "dependsOn": [
+                    {
+                        "activity": "WaitForIngestion",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "pipeline": {
+                        "referenceName": "pl_trigger_databricks_batch",
+                        "type": "PipelineReference"
+                    },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "triggerFullRefresh": "false",
+                        "runDate": {
+                            "value": "@formatDateTime(pipeline().TriggerTime, 'yyyy-MM-dd')",
+                            "type": "Expression"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "MonitorBronzeFreshness",
+                "description": "Execute child pipeline: validate Bronze table freshness and row count thresholds",
+                "type": "ExecutePipeline",
+                "dependsOn": [
+                    {
+                        "activity": "TriggerDatabricksBatch",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "pipeline": {
+                        "referenceName": "pl_monitor_bronze_freshness",
+                        "type": "PipelineReference"
+                    },
+                    "waitOnCompletion": true
+                }
+            },
+            {
+                "name": "LogRunSuccess",
+                "description": "Mark run as succeeded in audit log",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [
+                    {
+                        "activity": "MonitorBronzeFreshness",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls_sqlserver_omnioc",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[usp_adf_log_run]",
+                    "storedProcedureParameters": {
+                        "pipelineName": { "value": "pl_master_orchestrator", "type": "String" },
+                        "runId": { "value": { "value": "@pipeline().RunId", "type": "Expression" }, "type": "String" },
+                        "status": { "value": "Success", "type": "String" },
+                        "triggeredBy": { "value": { "value": "@pipeline().TriggerName", "type": "Expression" }, "type": "String" }
+                    }
+                }
+            },
+            {
+                "name": "LogRunFailure",
+                "description": "Mark run as failed and write error details to audit log",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [
+                    { "activity": "IngestSQLServerToADLS",  "dependencyConditions": ["Failed"] },
+                    { "activity": "ExtractCDCChanges",      "dependencyConditions": ["Failed"] },
+                    { "activity": "FetchExchangeRates",     "dependencyConditions": ["Failed"] },
+                    { "activity": "TriggerDatabricksBatch", "dependencyConditions": ["Failed"] },
+                    { "activity": "MonitorBronzeFreshness", "dependencyConditions": ["Failed"] }
+                ],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls_sqlserver_omnioc",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[usp_adf_log_run]",
+                    "storedProcedureParameters": {
+                        "pipelineName": { "value": "pl_master_orchestrator", "type": "String" },
+                        "runId": { "value": { "value": "@pipeline().RunId", "type": "Expression" }, "type": "String" },
+                        "status": { "value": "Failed", "type": "String" },
+                        "triggeredBy": { "value": { "value": "@pipeline().TriggerName", "type": "Expression" }, "type": "String" }
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "forceFullRefresh": {
+                "type": "bool",
+                "defaultValue": false
+            }
+        },
+        "variables": {
+            "runStatus": {
+                "type": "String",
+                "defaultValue": "Running"
+            }
+        },
+        "annotations": ["omnioc-lakehouse", "orchestration", "daily"],
+        "concurrency": 1
+    }
+}

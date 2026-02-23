@@ -1,0 +1,99 @@
+{
+    "name": "PL_08_Landing_Cleanup",
+    "properties": {
+        "description": "Archive and clean processed landing files after successful ingestion.\n\n                   Policy:\n                   - Files older than 7 days in landing/ → move to archive/YYYY/MM/DD/\n                   - Files older than 90 days in archive/ → delete permanently\n                   - CDC files: keep 30 days (audit requirement)\n                   - bad_data/ files: keep 90 days (DQ investigation)\n\n                   Uses Delete activity (native ADF) + Copy activity for archiving.\n                   Runs daily at 04:00 UTC (after batch ingestion completes).",
+        "activities": [
+            {
+                "name": "Archive Old Landing Files",
+                "description": "Copy landing files older than retention period to archive container.",
+                "type": "Copy",
+                "typeProperties": {
+                    "source": {
+                        "type": "BinarySource",
+                        "storeSettings": {
+                            "type": "AzureBlobFSReadSettings",
+                            "recursive": true,
+                            "modifiedDatetimeStart": {
+                                "value": "@{addDays(utcNow(), -90)}",
+                                "type": "Expression"
+                            },
+                            "modifiedDatetimeEnd": {
+                                "value": "@{addDays(utcNow(), -7)}",
+                                "type": "Expression"
+                            },
+                            "enablePartitionDiscovery": false
+                        }
+                    },
+                    "sink": {
+                        "type": "BinarySink",
+                        "storeSettings": {
+                            "type": "AzureBlobFSWriteSettings",
+                            "copyBehavior": "PreserveHierarchy"
+                        }
+                    },
+                    "enableStaging": false
+                },
+                "inputs": [{
+                    "referenceName": "DS_ADLS_Parquet",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "container":   "landing",
+                        "folder_path": "supply_chain",
+                        "file_name":   ""
+                    }
+                }],
+                "outputs": [{
+                    "referenceName": "DS_ADLS_Parquet",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "container":   "landing",
+                        "folder_path": {
+                            "value": "@concat('_archive/', formatDateTime(utcNow(), 'yyyy/MM/dd'), '/supply_chain')",
+                            "type": "Expression"
+                        },
+                        "file_name": ""
+                    }
+                }]
+            },
+            {
+                "name": "Delete Files Over Retention",
+                "description": "Permanently delete files from landing/ that are older than 7 days.\n                              Archive was already moved above — this cleans the hot path.",
+                "type": "Delete",
+                "dependsOn": [{ "activity": "Archive Old Landing Files", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "dataset": {
+                        "referenceName": "DS_ADLS_Parquet",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "container":   "landing",
+                            "folder_path": "supply_chain",
+                            "file_name":   ""
+                        }
+                    },
+                    "logStorageSettings": {
+                        "linkedServiceName": {
+                            "referenceName": "LS_ADLS_Gen2",
+                            "type": "LinkedServiceReference"
+                        },
+                        "path": "checkpoint/adf-logs/cleanup"
+                    },
+                    "enableLogging": true,
+                    "storeSettings": {
+                        "type": "AzureBlobFSReadSettings",
+                        "recursive": true,
+                        "modifiedDatetimeEnd": {
+                            "value": "@{addDays(utcNow(), -7)}",
+                            "type": "Expression"
+                        }
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "run_id":                   { "type": "String" },
+            "landing_retention_days":   { "type": "Int", "defaultValue": 7 },
+            "archive_retention_days":   { "type": "Int", "defaultValue": 90 }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:cleanup"]
+    }
+}

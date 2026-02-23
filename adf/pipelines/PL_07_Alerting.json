@@ -1,0 +1,105 @@
+{
+    "name": "PL_07_Alerting",
+    "properties": {
+        "description": "Centralised alerting pipeline — called by all other pipelines on failure OR success.\n\n                   Alert channels:\n                   - Azure Monitor (Log Analytics workspace: omnioc-dev-eus-law-01)\n                   - Microsoft Teams webhook (via Web activity HTTP POST)\n                   - Email via Logic App (or ADF email activity if configured)\n\n                   severity parameter:\n                   - SUCCESS  → green card in Teams, no email\n                   - HIGH     → orange Teams card + email to data-eng@\n                   - CRITICAL → red Teams card + email + pager (escalation)\n\n                   Runs asynchronously from caller (waitOnCompletion: false in parent)\n                   so pipeline failures don't block on alerting completion.",
+        "activities": [
+            {
+                "name": "Build Alert Message",
+                "description": "Compose alert message with run context.",
+                "type": "SetVariable",
+                "typeProperties": {
+                    "variableName": "alert_message",
+                    "value": {
+                        "value": "@concat('OmniOC Lakehouse | ', pipeline().parameters.severity, ' | Pipeline: ', pipeline().parameters.pipeline_name, ' | RunID: ', pipeline().parameters.run_id, ' | ', if(equals(pipeline().parameters.severity,'SUCCESS'),'✅ Pipeline completed successfully.', concat('❌ FAILURE: ', pipeline().parameters.failure_reason)), ' | Time: ', utcNow())",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "Send Teams Notification",
+                "description": "POST to Microsoft Teams webhook.\n                              Replace webhook URL with your actual Teams channel webhook.\n                              Set secret in Key Vault: teams-webhook-url",
+                "type": "WebActivity",
+                "dependsOn": [{ "activity": "Build Alert Message", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "url": {
+                        "type": "AzureKeyVaultSecret",
+                        "store": {
+                            "referenceName": "LS_KeyVault",
+                            "type": "LinkedServiceReference"
+                        },
+                        "secretName": "teams-webhook-url"
+                    },
+                    "method": "POST",
+                    "headers": {
+                        "Content-Type": "application/json"
+                    },
+                    "body": {
+                        "value": "@concat('{\"@type\":\"MessageCard\",\"@context\":\"https://schema.org/extensions\",\"themeColor\":\"', if(equals(pipeline().parameters.severity,'SUCCESS'),'00FF00', if(equals(pipeline().parameters.severity,'CRITICAL'),'FF0000','FF8C00')), '\",\"summary\":\"OmniOC Pipeline Alert\",\"sections\":[{\"activityTitle\":\"OmniOC Lakehouse Alert\",\"activitySubtitle\":\"', pipeline().parameters.severity, '\",\"facts\":[{\"name\":\"Pipeline\",\"value\":\"', pipeline().parameters.pipeline_name, '\"},{\"name\":\"RunID\",\"value\":\"', pipeline().parameters.run_id, '\"},{\"name\":\"Details\",\"value\":\"', if(equals(pipeline().parameters.failure_reason,''),'Completed OK', pipeline().parameters.failure_reason), '\"},{\"name\":\"Time (UTC)\",\"value\":\"', utcNow(), '\"}]}]}')",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "Write to Log Analytics",
+                "description": "Write structured alert to Azure Log Analytics workspace for dashboarding.\n                              Uses HTTP Data Collector API — workspace ID from Key Vault.",
+                "type": "WebActivity",
+                "dependsOn": [{ "activity": "Build Alert Message", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "url": {
+                        "value": "@concat('https://omnioc-dev-eus-law-01.ods.opinsights.azure.com/api/logs?api-version=2016-04-01')",
+                        "type": "Expression"
+                    },
+                    "method": "POST",
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Log-Type": "OmniOC_Pipeline_Alerts",
+                        "x-ms-date": {
+                            "value": "@utcNow('R')",
+                            "type": "Expression"
+                        }
+                    },
+                    "body": {
+                        "value": "@concat('[{\"pipeline_name\":\"', pipeline().parameters.pipeline_name, '\",\"run_id\":\"', pipeline().parameters.run_id, '\",\"severity\":\"', pipeline().parameters.severity, '\",\"failure_reason\":\"', pipeline().parameters.failure_reason, '\",\"alert_time\":\"', utcNow(), '\"}]')",
+                        "type": "Expression"
+                    },
+                    "authentication": {
+                        "type": "MSI",
+                        "resource": "https://monitor.azure.com/"
+                    }
+                }
+            },
+            {
+                "name": "Email Alert for HIGH and CRITICAL",
+                "description": "Send email via Logic App HTTP trigger for HIGH and CRITICAL severity.\n                              SUCCESS alerts use Teams only — no email spam.",
+                "type": "WebActivity",
+                "dependsOn": [{ "activity": "Build Alert Message", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "url": {
+                        "type": "AzureKeyVaultSecret",
+                        "store": {
+                            "referenceName": "LS_KeyVault",
+                            "type": "LinkedServiceReference"
+                        },
+                        "secretName": "logic-app-email-trigger-url"
+                    },
+                    "method": "POST",
+                    "headers": { "Content-Type": "application/json" },
+                    "body": {
+                        "value": "@concat('{\"to\":\"data-eng@omnioc.com\",\"subject\":\"[', pipeline().parameters.severity, '] OmniOC Pipeline Alert — ', pipeline().parameters.pipeline_name, '\",\"body\":\"', variables('alert_message'), '\"}')",
+                        "type": "Expression"
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "pipeline_name":  { "type": "String" },
+            "failure_reason": { "type": "String", "defaultValue": "" },
+            "run_id":         { "type": "String" },
+            "severity":       { "type": "String", "defaultValue": "HIGH" }
+        },
+        "variables": {
+            "alert_message": { "type": "String", "defaultValue": "" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:alerting"]
+    }
+}

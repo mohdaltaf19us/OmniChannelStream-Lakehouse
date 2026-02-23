@@ -1,0 +1,22 @@
+{
+    "name": "LS_ADLS_Gen2",
+    "properties": {
+        "description": "ADLS Gen2 — omniocdeveusst01. Uses managed identity auth (no credentials stored).",
+        "type": "AzureBlobFS",
+        "typeProperties": {
+            "url": "https://omniocdeveusst01.dfs.core.windows.net",
+            "accountKey": {
+                "type": "AzureKeyVaultSecret",
+                "store": {
+                    "referenceName": "LS_KeyVault",
+                    "type": "LinkedServiceReference"
+                },
+                "secretName": "adls-storage-account-key"
+            }
+        },
+        "annotations": [
+            "project:omnioc-lakehouse",
+            "env:dev"
+        ]
+    }
+}

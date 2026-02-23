@@ -1,0 +1,256 @@
+{
+    "name": "pl_monitor_bronze_freshness",
+    "type": "Microsoft.DataFactory/factories/pipelines",
+    "properties": {
+        "description": "Post-load monitoring pipeline. Calls Databricks SQL API to check Bronze table row counts and ingest freshness. Sends Teams alert if any table is stale or below row count threshold. This is the ADF-native observability layer — Databricks DQ notebooks do the deep validation; this one watches for complete pipeline failures.",
+        "activities": [
+            {
+                "name": "GetDatabricksToken",
+                "description": "Fetch token from Key Vault for Databricks SQL API calls",
+                "type": "WebActivity",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "url": "https://omnioc-dev-eus-kv-01.vault.azure.net/secrets/databricks-adf-access-token?api-version=7.0",
+                    "authentication": {
+                        "type": "MSI",
+                        "resource": "https://vault.azure.net"
+                    }
+                }
+            },
+            {
+                "name": "CheckOrdersFreshness",
+                "description": "Query Databricks SQL API: how many orders were ingested in the last 25 hours?",
+                "type": "WebActivity",
+                "dependsOn": [
+                    {
+                        "activity": "GetDatabricksToken",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.00:05:00",
+                    "retry": 2
+                },
+                "typeProperties": {
+                    "method": "POST",
+                    "url": "https://adb-7405609624004172.12.azuredatabricks.net/api/2.0/sql/statements",
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Authorization": {
+                            "value": "@concat('Bearer ', activity('GetDatabricksToken').output.value)",
+                            "type": "Expression"
+                        }
+                    },
+                    "body": {
+                        "statement": "SELECT COUNT(*) AS row_count, MAX(_ingest_time) AS latest_ingest FROM omnioc_dev.bronze.orders_raw WHERE _ingest_time >= DATEADD(HOUR, -25, CURRENT_TIMESTAMP())",
+                        "warehouse_id": "auto",
+                        "catalog": "omnioc_dev",
+                        "schema": "bronze",
+                        "wait_timeout": "60s",
+                        "on_wait_timeout": "CANCEL"
+                    }
+                }
+            },
+            {
+                "name": "CheckCustomersFreshness",
+                "description": "Query Databricks SQL API: customers Bronze freshness",
+                "type": "WebActivity",
+                "dependsOn": [
+                    {
+                        "activity": "GetDatabricksToken",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.00:05:00",
+                    "retry": 2
+                },
+                "typeProperties": {
+                    "method": "POST",
+                    "url": "https://adb-7405609624004172.12.azuredatabricks.net/api/2.0/sql/statements",
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Authorization": {
+                            "value": "@concat('Bearer ', activity('GetDatabricksToken').output.value)",
+                            "type": "Expression"
+                        }
+                    },
+                    "body": {
+                        "statement": "SELECT COUNT(*) AS row_count, MAX(_ingest_time) AS latest_ingest FROM omnioc_dev.bronze.customers_raw WHERE _ingest_time >= DATEADD(HOUR, -25, CURRENT_TIMESTAMP())",
+                        "warehouse_id": "auto",
+                        "catalog": "omnioc_dev",
+                        "schema": "bronze",
+                        "wait_timeout": "60s",
+                        "on_wait_timeout": "CANCEL"
+                    }
+                }
+            },
+            {
+                "name": "EvaluateOrdersFreshness",
+                "description": "Check if orders row count >= 100 (minimum expected daily load)",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "CheckOrdersFreshness",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@less(int(activity('CheckOrdersFreshness').output.result.data_array[0][0]), 100)",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "SetOrdersStaleFlag",
+                            "type": "SetVariable",
+                            "typeProperties": {
+                                "variableName": "alertMessage",
+                                "value": {
+                                    "value": "@concat(variables('alertMessage'), '⚠️ orders_raw: only ', activity('CheckOrdersFreshness').output.result.data_array[0][0], ' rows in last 25h (expected >= 100)\n')",
+                                    "type": "Expression"
+                                }
+                            }
+                        },
+                        {
+                            "name": "MarkAlertsNeeded",
+                            "type": "SetVariable",
+                            "dependsOn": [
+                                {
+                                    "activity": "SetOrdersStaleFlag",
+                                    "dependencyConditions": ["Succeeded"]
+                                }
+                            ],
+                            "typeProperties": {
+                                "variableName": "alertRequired",
+                                "value": true
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "EvaluateCustomersFreshness",
+                "description": "Check customers freshness",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "CheckCustomersFreshness",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@less(int(activity('CheckCustomersFreshness').output.result.data_array[0][0]), 10)",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "SetCustomersStaleFlag",
+                            "type": "SetVariable",
+                            "typeProperties": {
+                                "variableName": "alertMessage",
+                                "value": {
+                                    "value": "@concat(variables('alertMessage'), '⚠️ customers_raw: only ', activity('CheckCustomersFreshness').output.result.data_array[0][0], ' rows in last 25h (expected >= 10)\n')",
+                                    "type": "Expression"
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "SendTeamsAlertIfNeeded",
+                "description": "Post Teams message if any freshness checks failed",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "EvaluateOrdersFreshness",
+                        "dependencyConditions": ["Succeeded"]
+                    },
+                    {
+                        "activity": "EvaluateCustomersFreshness",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@variables('alertRequired')",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "PostTeamsAlert",
+                            "description": "Send adaptive card to Teams data-engineering-alerts channel",
+                            "type": "WebActivity",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "0.00:01:00",
+                                "retry": 3
+                            },
+                            "typeProperties": {
+                                "method": "POST",
+                                "url": {
+                                    "value": "@activity('GetTeamsWebhook').output.value",
+                                    "type": "Expression"
+                                },
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "body": {
+                                    "value": "@json(concat('{\"@type\":\"MessageCard\",\"@context\":\"https://schema.org/extensions\",\"themeColor\":\"FF0000\",\"summary\":\"OmniOC Bronze Freshness Alert\",\"sections\":[{\"activityTitle\":\"🔴 OmniOC Lakehouse — Bronze Freshness Alert\",\"activitySubtitle\":\"ADF Pipeline: pl_monitor_bronze_freshness\",\"activityImage\":\"https://azure.microsoft.com/favicon.ico\",\"facts\":[{\"name\":\"Pipeline Run\",\"value\":\"', pipeline().RunId, '\"},{\"name\":\"Run Time\",\"value\":\"', formatDateTime(pipeline().TriggerTime, 'yyyy-MM-dd HH:mm UTC'), '\"},{\"name\":\"Issues Detected\",\"value\":\"', replace(variables('alertMessage'), '\"', '\\\"'), '\"}],\"markdown\":true}],\"potentialAction\":[{\"@type\":\"OpenUri\",\"name\":\"View ADF Pipeline\",\"targets\":[{\"os\":\"default\",\"uri\":\"https://adf.azure.com/en/monitoring/pipelineruns\"}]}]}'))",
+                                    "type": "Expression"
+                                }
+                            }
+                        }
+                    ],
+                    "ifFalseActivities": [
+                        {
+                            "name": "LogAllGreen",
+                            "description": "All freshness checks passed — log success",
+                            "type": "SetVariable",
+                            "typeProperties": {
+                                "variableName": "alertMessage",
+                                "value": "All Bronze tables fresh ✅"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "GetTeamsWebhook",
+                "description": "Fetch Teams webhook URL from Key Vault",
+                "type": "WebActivity",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "url": "https://omnioc-dev-eus-kv-01.vault.azure.net/secrets/teams-webhook-data-alerts?api-version=7.0",
+                    "authentication": {
+                        "type": "MSI",
+                        "resource": "https://vault.azure.net"
+                    }
+                }
+            }
+        ],
+        "variables": {
+            "alertRequired": {
+                "type": "Boolean",
+                "defaultValue": false
+            },
+            "alertMessage": {
+                "type": "String",
+                "defaultValue": ""
+            }
+        },
+        "annotations": ["omnioc-lakehouse", "monitoring", "freshness", "teams-alert"]
+    }
+}

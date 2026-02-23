@@ -1,0 +1,37 @@
+{
+    "name": "ds_adls_json_landing",
+    "type": "Microsoft.DataFactory/factories/datasets",
+    "properties": {
+        "description": "ADLS Gen2 JSON Lines sink — used for CDC change records landing in landing/cdc/{table}/{date}/*.json",
+        "linkedServiceName": {
+            "referenceName": "ls_adls_omniocdeveusst01",
+            "type": "LinkedServiceReference"
+        },
+        "parameters": {
+            "folderPath": {
+                "type": "String",
+                "defaultValue": "cdc"
+            },
+            "fileName": {
+                "type": "String"
+            }
+        },
+        "type": "Json",
+        "typeProperties": {
+            "location": {
+                "type": "AzureBlobFSLocation",
+                "fileSystem": "landing",
+                "folderPath": {
+                    "value": "@dataset().folderPath",
+                    "type": "Expression"
+                },
+                "fileName": {
+                    "value": "@dataset().fileName",
+                    "type": "Expression"
+                }
+            },
+            "encodingName": "UTF-8"
+        },
+        "schema": {}
+    }
+}

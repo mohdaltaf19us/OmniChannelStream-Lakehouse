@@ -1,0 +1,43 @@
+{
+    "name": "ls_sqlserver_omnioc",
+    "type": "Microsoft.DataFactory/factories/linkedservices",
+    "properties": {
+        "description": "SQL Server 2022 — source of record for supply chain transactional data. Password fetched from Key Vault at runtime; no credentials stored in ADF.",
+        "type": "SqlServer",
+        "typeProperties": {
+            "server": {
+                "type": "AzureKeyVaultSecret",
+                "store": {
+                    "referenceName": "ls_keyvault_omnioc",
+                    "type": "LinkedServiceReference"
+                },
+                "secretName": "sqlserver-host"
+            },
+            "database": "OmniOC_OLTP",
+            "authenticationType": "SQL",
+            "userName": "omnioc_adf_reader",
+            "password": {
+                "type": "AzureKeyVaultSecret",
+                "store": {
+                    "referenceName": "ls_keyvault_omnioc",
+                    "type": "LinkedServiceReference"
+                },
+                "secretName": "sqlserver-adf-reader-password"
+            },
+            "encrypt": true,
+            "trustServerCertificate": false,
+            "connectionTimeout": 30,
+            "commandTimeout": 120,
+            "applicationIntent": "ReadOnly"
+        },
+        "connectVia": {
+            "referenceName": "SelfHostedIntegrationRuntime",
+            "type": "IntegrationRuntimeReference"
+        },
+        "annotations": [
+            "omnioc-lakehouse",
+            "sqlserver",
+            "on-prem-source"
+        ]
+    }
+}
