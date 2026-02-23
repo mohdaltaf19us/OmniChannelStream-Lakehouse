@@ -88,7 +88,7 @@ print("\n🎯 All checks passed — ready to run notebooks 01 → 05")
 spark.sql("USE CATALOG omnioc_dev")
 spark.sql("USE SCHEMA bronze")
 
-# BASE = "abfss://bronze@omniocdeveusst01.dfs.core.windows.net"
+BASE = "abfss://bronze@omniocdeveusst01.dfs.core.windows.net"
 print(f"✅ Target location: {BASE}")
 
 
