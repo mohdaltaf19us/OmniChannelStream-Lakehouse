@@ -26,6 +26,7 @@
 # MAGIC   selectExpr    — products: all casts as SQL strings
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 1 — Config
 from pyspark.sql.functions import (
     col, current_timestamp, lit, md5, concat_ws,
@@ -72,7 +73,10 @@ print(f"   Silver         : {SILVER}")
 print(f"   Open-end stamp : {OPEN_END}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 2 — customers_scd
+from pyspark.sql.functions import from_json, coalesce
+from pyspark.sql.types import StructType, StructField, StringType, BooleanType, IntegerType
 
 CUSTOMER_TRACKED = [
     "first_name", "last_name", "email", "phone",
@@ -88,7 +92,42 @@ def ltv_score(lifetime_value: pd.Series, age_months: pd.Series) -> pd.Series:
 w_segment_rank  = Window.partitionBy("segment").orderBy(col("lifetime_value").cast("double").desc())
 w_customer_hist = Window.partitionBy("customer_id").orderBy(col("_ingest_time"))
 
-df_customers_raw = spark.table(f"{BRONZE}.cdc_customers_raw")
+# ── Parse CDC JSON format ─────────────────────────────────────────────────────
+customer_schema = StructType([
+    StructField("customer_id", StringType(), True),
+    StructField("first_name", StringType(), True),
+    StructField("last_name", StringType(), True),
+    StructField("email", StringType(), True),
+    StructField("phone", StringType(), True),
+    StructField("country", StringType(), True),
+    StructField("city", StringType(), True),
+    StructField("segment", StringType(), True),
+    StructField("is_active", BooleanType(), True),
+    StructField("lifetime_value", StringType(), True),
+])
+
+df_cdc_raw = spark.table(f"{BRONZE}.cdc_customers_raw")
+
+# Parse JSON and flatten, using 'after' for INSERT/UPDATE, 'before' for DELETE
+df_customers_raw = (
+    df_cdc_raw
+    .withColumn("after_parsed", from_json(col("after"), customer_schema))
+    .withColumn("before_parsed", from_json(col("before"), customer_schema))
+    .select(
+        coalesce(col("after_parsed.customer_id"), col("before_parsed.customer_id")).alias("customer_id"),
+        coalesce(col("after_parsed.first_name"), col("before_parsed.first_name")).alias("first_name"),
+        coalesce(col("after_parsed.last_name"), col("before_parsed.last_name")).alias("last_name"),
+        coalesce(col("after_parsed.email"), col("before_parsed.email")).alias("email"),
+        coalesce(col("after_parsed.phone"), col("before_parsed.phone")).alias("phone"),
+        coalesce(col("after_parsed.country"), col("before_parsed.country")).alias("country"),
+        coalesce(col("after_parsed.city"), col("before_parsed.city")).alias("city"),
+        coalesce(col("after_parsed.segment"), col("before_parsed.segment")).alias("segment"),
+        coalesce(col("after_parsed.is_active"), col("before_parsed.is_active")).alias("is_active"),
+        coalesce(col("after_parsed.lifetime_value"), col("before_parsed.lifetime_value")).alias("lifetime_value"),
+        col("operation").alias("cdc_operation"),
+        col("_ingest_time")
+    )
+)
 
 # ── intersectAll — confirm only known CDC operations arrive ───────────────────
 from pyspark.sql import Row
@@ -147,6 +186,8 @@ df_customers_cdc = (
     .withColumn("ltv_score",
         ltv_score(col("lifetime_value"), col("account_age_months").cast("double"))
     )
+    .withColumn("_silver_ingest_time", current_timestamp())
+    .withColumn("_bronze_source", lit("cdc_customers_raw"))
 )
 
 df_customers_cdc.createOrReplaceTempView("customers_cdc_typed")
@@ -215,16 +256,54 @@ spark.sql(f"""
 """).show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 3 — products_scd
+from pyspark.sql.functions import from_json, coalesce
+from pyspark.sql.types import StructType, StructField, StringType, BooleanType, DoubleType
 
 PRODUCT_TRACKED = [
     "product_name", "sku", "category", "sub_category",
     "unit_cost", "unit_price", "is_active", "supplier_id",
 ]
 
+# ── Parse CDC JSON format ─────────────────────────────────────────────────────
+product_schema = StructType([
+    StructField("product_id", StringType(), True),
+    StructField("product_name", StringType(), True),
+    StructField("sku", StringType(), True),
+    StructField("category", StringType(), True),
+    StructField("sub_category", StringType(), True),
+    StructField("unit_cost", DoubleType(), True),
+    StructField("unit_price", DoubleType(), True),
+    StructField("is_active", BooleanType(), True),
+    StructField("supplier_id", StringType(), True),
+])
+
+df_cdc_raw = spark.table(f"{BRONZE}.cdc_products_raw")
+
+# Parse JSON and flatten, using 'after' for INSERT/UPDATE, 'before' for DELETE
+df_products_raw = (
+    df_cdc_raw
+    .withColumn("after_parsed", from_json(col("after"), product_schema))
+    .withColumn("before_parsed", from_json(col("before"), product_schema))
+    .select(
+        coalesce(col("after_parsed.product_id"), col("before_parsed.product_id")).alias("product_id"),
+        coalesce(col("after_parsed.product_name"), col("before_parsed.product_name")).alias("product_name"),
+        coalesce(col("after_parsed.sku"), col("before_parsed.sku")).alias("sku"),
+        coalesce(col("after_parsed.category"), col("before_parsed.category")).alias("category"),
+        coalesce(col("after_parsed.sub_category"), col("before_parsed.sub_category")).alias("sub_category"),
+        coalesce(col("after_parsed.unit_cost"), col("before_parsed.unit_cost")).alias("unit_cost"),
+        coalesce(col("after_parsed.unit_price"), col("before_parsed.unit_price")).alias("unit_price"),
+        coalesce(col("after_parsed.is_active"), col("before_parsed.is_active")).alias("is_active"),
+        coalesce(col("after_parsed.supplier_id"), col("before_parsed.supplier_id")).alias("supplier_id"),
+        col("operation").alias("cdc_operation"),
+        col("_ingest_time")
+    )
+)
+
 df_products_cdc = (
     # ── selectExpr — all casts + derivations as SQL string expressions ────────
-    spark.table(f"{BRONZE}.cdc_products_raw").selectExpr(
+    df_products_raw.selectExpr(
         "product_id", "product_name", "sku", "category", "sub_category",
         "CAST(unit_cost  AS DOUBLE) AS unit_cost",
         "CAST(unit_price AS DOUBLE) AS unit_price",
@@ -247,6 +326,8 @@ df_products_cdc = (
         "_record_hash",
         md5(concat_ws("||", *[col(c).cast("string") for c in PRODUCT_TRACKED]))
     )
+    .withColumn("_silver_ingest_time", current_timestamp())
+    .withColumn("_bronze_source", lit("cdc_products_raw"))
 )
 
 df_products_cdc.createOrReplaceTempView("products_cdc_typed")
@@ -312,6 +393,7 @@ spark.sql(f"""
 """).show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 4 — Verification
 OPEN_END_TS = f"CAST('{OPEN_END}' AS TIMESTAMP)"
 print("── CDC Silver — SCD Type 2 Verification ─────────────────────────────")

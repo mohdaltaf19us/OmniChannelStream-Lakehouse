@@ -20,6 +20,7 @@
 # MAGIC | exchange_rates | intersectAll currency validation |
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 1 — Config
 from pyspark.sql.functions import (
     col, to_timestamp, to_date, current_timestamp, lit,
@@ -48,6 +49,7 @@ def merge_cols(update_cols):
 print(f"✅ Config — Bronze: {BRONZE}  Silver: {SILVER}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 2 — customers
 # Techniques: regexp_extract, translate, months_between, dense_rank(), pandas_udf
 # EXCLUDES: _silver_date (GENERATED from _silver_ingest_time)
@@ -58,7 +60,7 @@ def ltv_score(lifetime_value: pd.Series, age_months: pd.Series) -> pd.Series:
     return ((lifetime_value.clip(0, 100_000) / 100_000 * 60)
           + (age_months.clip(0, 60) / 60 * 40)).round(2)
 
-w_segment_rank = Window.partitionBy("segment").orderBy(col("lifetime_value").cast("double").desc())
+w_segment_rank = Window.partitionBy("segment").orderBy(lit(0.0).desc())
 
 df_customers = (
     spark.table(f"{BRONZE}.customers_raw")
@@ -71,9 +73,9 @@ df_customers = (
         col("country"),
         col("city"),
         col("segment"),
-        to_date(col("registration_date")).alias("registration_date"),
+        to_date(col("signup_date")).alias("registration_date"),
         col("is_active").cast("boolean"),
-        col("lifetime_value").cast("double"),
+        lit(0.0).alias("lifetime_value"),
         to_timestamp(col("created_at")).alias("created_at"),
         to_timestamp(col("updated_at")).alias("updated_at"),
         # ── concat_ws — full display name ─────────────────────────────────────
@@ -90,7 +92,7 @@ df_customers = (
         spark_round(
             months_between(current_timestamp(), to_timestamp(col("created_at"))), 1
         ).cast("int").alias("account_age_months"),
-        datediff(current_timestamp().cast("date"), to_date(col("registration_date")))
+        datediff(current_timestamp().cast("date"), to_date(col("signup_date")))
             .alias("account_age_days"),
         # ── Business derivations ──────────────────────────────────────────────
         when(col("lifetime_value").cast("double") >= 50000, "VIP")
@@ -152,6 +154,7 @@ spark.sql(f"""
 """).show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 3 — orders
 # Techniques: na.replace, date_trunc, rollup
 # EXCLUDES: _event_date (GENERATED from order_date)
@@ -174,7 +177,7 @@ df_orders = (
         col("discount_amount").cast("double"),
         col("tax_amount").cast("double"),
         col("shipping_amount").cast("double"),
-        col("shipping_country"),
+        col("shipping_address_country").alias("shipping_country"),
         to_timestamp(col("created_at")).alias("created_at"),
         to_timestamp(col("updated_at")).alias("updated_at"),
         # ── date_trunc — month reporting key e.g. '2024-01-01' ───────────────
@@ -248,6 +251,7 @@ spark.table(f"{SILVER}.orders") \
     .show(12)
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 4 — order_lines
 # Techniques: withColumnRenamed, all business logic in SQL view
 # EXCLUDES: _silver_date (GENERATED)
@@ -308,6 +312,7 @@ cnt = spark.sql(f"SELECT COUNT(*) FROM {SILVER}.order_lines").collect()[0][0]
 print(f"✅ order_lines — {cnt:,} rows")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 5 — payments
 # Techniques: pivot
 # EXCLUDES: _event_date (GENERATED from payment_date)
@@ -315,22 +320,24 @@ print(f"✅ order_lines — {cnt:,} rows")
 df_payments = (
     spark.table(f"{BRONZE}.payments_raw")
     .select(
-        col("payment_id"), col("order_id"), col("customer_id"),
-        to_date(col("payment_date")).alias("payment_date"),
-        col("payment_method"),
+        col("payment_id"), col("order_id"),
+        lit(None).cast("string").alias("customer_id"),
+        to_date(col("paid_at")).alias("payment_date"),
+        col("method").alias("payment_method"),
         col("amount").cast("double"),
-        col("currency"), col("status"), col("gateway"), col("transaction_ref"),
+        col("currency"), col("status"), col("gateway"),
+        col("transaction_id").alias("transaction_ref"),
         # ── Business derivations ──────────────────────────────────────────────
         (col("status") == "completed").alias("is_successful"),
         (col("status") == "failed").alias("is_failed"),
         (col("status") == "refunded").alias("is_refunded"),
-        col("payment_method").isin("credit_card", "debit_card").alias("is_card_payment"),
-        col("payment_method").isin("credit_card", "debit_card", "paypal", "crypto")
+        col("method").isin("credit_card", "debit_card").alias("is_card_payment"),
+        col("method").isin("credit_card", "debit_card", "paypal", "crypto")
             .alias("is_digital_payment"),
-        when(col("payment_method").isin("credit_card", "debit_card"), "card")
-        .when(col("payment_method") == "paypal",        "digital_wallet")
-        .when(col("payment_method") == "bank_transfer", "bank")
-        .when(col("payment_method") == "crypto",        "crypto")
+        when(col("method").isin("credit_card", "debit_card"), "card")
+        .when(col("method") == "paypal",        "digital_wallet")
+        .when(col("method") == "bank_transfer", "bank")
+        .when(col("method") == "crypto",        "crypto")
         .otherwise("other").alias("payment_category"),
         current_timestamp().alias("_silver_ingest_time"),
         lit("payments_raw").alias("_bronze_source"),
@@ -375,7 +382,7 @@ cnt = spark.sql(f"SELECT COUNT(*) FROM {SILVER}.payments").collect()[0][0]
 print(f"✅ payments — {cnt:,} rows")
 
 # ── pivot — count of payments by status across payment categories ──────────────
-print("\n── Pivot: payment_category × status (count) ─────────────────────────")
+print("\n── Pivot: payment_category × status (count) ─────────────────────")
 spark.table(f"{SILVER}.payments") \
     .groupBy("payment_category") \
     .pivot("status", ["pending", "completed", "failed", "refunded"]) \
@@ -384,21 +391,35 @@ spark.table(f"{SILVER}.payments") \
     .show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 6 — refunds
 # Techniques: lead() over window — detect repeat refunders
 # EXCLUDES: _event_date (GENERATED from refund_date)
 
+df_refunds_base = (
+    spark.table(f"{BRONZE}.refunds_raw")
+    .select(
+        col("refund_id"), col("order_id"),
+        lit(None).cast("string").alias("payment_id"),
+        lit(None).cast("string").alias("customer_id"),
+        to_date(col("processed_at")).alias("refund_date"),
+        col("refund_amount").cast("double"),
+        col("currency"), col("reason"), col("status"),
+        col("_ingest_time"),
+    )
+)
+
 w_customer_refund = Window.partitionBy("customer_id").orderBy("refund_date")
 
 df_refunds = (
-    spark.table(f"{BRONZE}.refunds_raw")
+    df_refunds_base
     .select(
         col("refund_id"), col("order_id"), col("payment_id"), col("customer_id"),
-        to_date(col("refund_date")).alias("refund_date"),
-        col("refund_amount").cast("double"),
+        col("refund_date"),
+        col("refund_amount"),
         col("currency"), col("reason"), col("status"),
         # ── Business derivations ──────────────────────────────────────────────
-        (col("refund_amount").cast("double") >= 500).alias("is_high_value_refund"),
+        (col("refund_amount") >= 500).alias("is_high_value_refund"),
         (col("status") == "completed").alias("is_processed"),
         (col("status") == "rejected").alias("is_rejected"),
         when(col("reason").isin("defective", "wrong_item"), "product_issue")
@@ -406,11 +427,10 @@ df_refunds = (
         .when(col("reason") == "customer_request",           "customer_initiated")
         .otherwise("other").alias("refund_reason_category"),
         # ── lead() — next refund date for same customer ────────────────────────
-        lead(to_date(col("refund_date")), 1)
-        .over(w_customer_refund).alias("next_refund_date"),
+        lead(col("refund_date"), 1).over(w_customer_refund).alias("next_refund_date"),
         datediff(
-            lead(to_date(col("refund_date")), 1).over(w_customer_refund),
-            to_date(col("refund_date"))
+            lead(col("refund_date"), 1).over(w_customer_refund),
+            col("refund_date")
         ).alias("days_to_next_refund"),
         current_timestamp().alias("_silver_ingest_time"),
         lit("refunds_raw").alias("_bronze_source"),
@@ -453,8 +473,15 @@ spark.sql(f"""
 
 cnt = spark.sql(f"SELECT COUNT(*) FROM {SILVER}.refunds").collect()[0][0]
 print(f"✅ refunds — {cnt:,} rows")
+spark.sql(f"""
+    SELECT refund_reason_category, COUNT(*) cnt,
+           ROUND(AVG(refund_amount),0) avg_amt,
+           ROUND(AVG(days_to_next_refund),1) avg_days_to_next
+    FROM {SILVER}.refunds GROUP BY 1 ORDER BY cnt DESC
+""").show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 7 — exchange_rates
 # Techniques: intersectAll — validate major currencies loaded
 # EXCLUDES: _event_date (GENERATED from rate_date)
@@ -464,20 +491,24 @@ from pyspark.sql import Row
 df_exchange_rates = (
     spark.table(f"{BRONZE}.exchange_rates_raw")
     .select(
-        col("rate_id"),
-        upper(trim(col("from_currency"))).alias("from_currency"),
-        upper(trim(col("to_currency"))).alias("to_currency"),
+        concat_ws("_",
+            col("rate_date"),
+            upper(trim(col("base_currency"))),
+            upper(trim(col("target_currency")))
+        ).alias("rate_id"),
+        upper(trim(col("base_currency"))).alias("from_currency"),
+        upper(trim(col("target_currency"))).alias("to_currency"),
         to_date(col("rate_date")).alias("rate_date"),
         col("exchange_rate").cast("double"),
         col("source"),
         spark_round(lit(1.0) / col("exchange_rate").cast("double"), 8).alias("inverse_rate"),
         concat_ws("_",
-            upper(trim(col("from_currency"))),
-            upper(trim(col("to_currency")))
+            upper(trim(col("base_currency"))),
+            upper(trim(col("target_currency")))
         ).alias("pair_key"),
         (
-            upper(trim(col("from_currency"))).isin(MAJOR_CURRENCIES) &
-            upper(trim(col("to_currency"))).isin(MAJOR_CURRENCIES)
+            upper(trim(col("base_currency"))).isin(MAJOR_CURRENCIES) &
+            upper(trim(col("target_currency"))).isin(MAJOR_CURRENCIES)
         ).alias("is_major_pair"),
         datediff(current_timestamp().cast("date"), to_date(col("rate_date")))
             .alias("rate_age_days"),
@@ -527,6 +558,7 @@ print(f"\n── intersectAll: {df_confirmed.count()}/{len(MAJOR_CURRENCIES)} ma
 df_confirmed.show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 8 — Verification
 print("── Finance Silver — Verification ───────────────────────────────────")
 checks = [

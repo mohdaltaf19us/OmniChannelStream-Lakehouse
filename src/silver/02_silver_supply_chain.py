@@ -19,6 +19,7 @@
 # MAGIC | 7 | Verification |
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 1 — Config
 from pyspark.sql.functions import (
     col, to_timestamp, to_date, current_timestamp, lit,
@@ -44,6 +45,7 @@ def merge_cols(update_cols):
 print(f"✅ Config — Bronze: {BRONZE}  Silver: {SILVER}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 2 — suppliers
 # Techniques: regexp_replace, window rank(), avg() over window
 # EXCLUDES from MERGE: _silver_date (GENERATED from _silver_ingest_time)
@@ -132,6 +134,7 @@ spark.sql(f"""
 """).show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 3 — products
 # Techniques: selectExpr, split() array index
 # EXCLUDES from MERGE: _silver_date (GENERATED)
@@ -209,6 +212,7 @@ spark.sql(f"""
 """).show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 4 — warehouses
 # EXCLUDES from MERGE: _silver_date (GENERATED)
 
@@ -219,8 +223,8 @@ df_warehouses = (
         col("capacity_sqft").cast("int"),
         col("is_active").cast("boolean"),
         col("manager_name"),
-        lower(trim(col("contact_email"))).alias("contact_email"),
-        to_timestamp(col("created_at")).alias("created_at"),
+        lower(trim(col("manager_email"))).alias("contact_email"),
+        to_timestamp(col("opened_date")).alias("created_at"),
         when(col("capacity_sqft").cast("int") < 50000,    "small")
         .when(col("capacity_sqft").cast("int") <= 200000, "medium")
         .otherwise("large").alias("capacity_tier"),
@@ -266,6 +270,7 @@ cnt = spark.sql(f"SELECT COUNT(*) FROM {SILVER}.warehouses").collect()[0][0]
 print(f"✅ warehouses — {cnt:,} rows")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 5 — shipments
 # Techniques: na.fill, coalesce, sortWithinPartitions
 # EXCLUDES from MERGE: _event_date (GENERATED from shipment_date)
@@ -278,32 +283,35 @@ df_shipments_filled = df_shipments_raw.na.fill({"status": "unknown", "carrier": 
 df_shipments = (
     df_shipments_filled
     .select(
-        col("shipment_id"), col("order_id"), col("supplier_id"),
-        col("warehouse_id"), col("product_id"),
+        col("shipment_id"),
+        lit(None).cast("string").alias("order_id"),
+        col("supplier_id"),
+        col("destination_warehouse_id").alias("warehouse_id"),
+        col("product_id"),
         col("quantity").cast("int"),
-        to_date(col("shipment_date")).alias("shipment_date"),
-        to_date(col("expected_arrival")).alias("expected_arrival"),
+        to_date(col("ship_date")).alias("shipment_date"),
+        to_date(col("eta_date")).alias("expected_arrival"),
         # ── coalesce — null-safe fallback for actual_arrival ──────────────────
-        coalesce(to_date(col("actual_arrival")), to_date(col("expected_arrival")))
+        coalesce(to_date(col("actual_arrival_date")), to_date(col("eta_date")))
             .alias("actual_arrival"),
         col("carrier"), col("tracking_number"), col("status"),
-        col("freight_cost").cast("double"),
+        col("total_cost").cast("double").alias("freight_cost"),
         # ── Business derivations ──────────────────────────────────────────────
-        (col("actual_arrival").isNotNull() &
-         (to_date(col("actual_arrival")) > to_date(col("expected_arrival")))
+        (col("actual_arrival_date").isNotNull() &
+         (to_date(col("actual_arrival_date")) > to_date(col("eta_date")))
         ).alias("is_delayed"),
-        when(col("actual_arrival").isNotNull(),
-             datediff(to_date(col("actual_arrival")), to_date(col("expected_arrival")))
+        when(col("actual_arrival_date").isNotNull(),
+             datediff(to_date(col("actual_arrival_date")), to_date(col("eta_date")))
         ).alias("delay_days"),
-        when(col("actual_arrival").isNotNull(),
-             datediff(to_date(col("actual_arrival")), to_date(col("shipment_date")))
+        when(col("actual_arrival_date").isNotNull(),
+             datediff(to_date(col("actual_arrival_date")), to_date(col("ship_date")))
         ).alias("transit_days"),
-        datediff(to_date(col("expected_arrival")), to_date(col("shipment_date")))
+        datediff(to_date(col("eta_date")), to_date(col("ship_date")))
             .alias("expected_transit_days"),
-        when(col("actual_arrival").isNull(), "in_transit")
-        .when(to_date(col("actual_arrival")) <= to_date(col("expected_arrival")), "on_time_or_early")
+        when(col("actual_arrival_date").isNull(), "in_transit")
+        .when(to_date(col("actual_arrival_date")) <= to_date(col("eta_date")), "on_time_or_early")
         .otherwise("delayed").alias("delivery_status"),
-        spark_round(col("freight_cost").cast("double") / col("quantity").cast("double"), 4)
+        spark_round(col("total_cost").cast("double") / col("quantity").cast("double"), 4)
             .alias("freight_cost_per_unit"),
         current_timestamp().alias("_silver_ingest_time"),
         lit("shipments_raw").alias("_bronze_source"),
@@ -360,6 +368,7 @@ spark.table(f"{SILVER}.shipments") \
     .show(10)
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 6 — supplier_contracts
 # Techniques: months_between, date_trunc
 # EXCLUDES from MERGE: _silver_date (GENERATED)
@@ -370,11 +379,11 @@ df_supplier_contracts = (
         col("contract_id"), col("supplier_id"), col("contract_type"),
         to_date(col("start_date")).alias("start_date"),
         to_date(col("end_date")).alias("end_date"),
-        col("annual_value_usd").cast("double"),
-        col("payment_terms_days").cast("int"),
-        col("auto_renew").cast("boolean"),
+        col("total_value_usd").cast("double").alias("annual_value_usd"),
+        lit(None).cast("int").alias("payment_terms_days"),
+        col("auto_renewal").cast("boolean").alias("auto_renew"),
         col("is_active").cast("boolean"),
-        col("signed_by"),
+        lit(None).cast("string").alias("signed_by"),
         # ── months_between — precise fractional month count ───────────────────
         spark_round(
             months_between(to_date(col("end_date")), to_date(col("start_date"))), 1
@@ -390,8 +399,8 @@ df_supplier_contracts = (
             .alias("is_expired"),
         datediff(to_date(col("end_date")), to_date(col("start_date")))
             .alias("contract_duration_days"),
-        when(col("annual_value_usd").cast("double") < 100000,    "low")
-        .when(col("annual_value_usd").cast("double") <= 1000000, "mid")
+        when(col("total_value_usd").cast("double") < 100000,    "low")
+        .when(col("total_value_usd").cast("double") <= 1000000, "mid")
         .otherwise("high").alias("contract_value_tier"),
         current_timestamp().alias("_silver_ingest_time"),
         lit("supplier_contracts_raw").alias("_bronze_source"),
@@ -441,6 +450,7 @@ spark.sql(f"""
 """).show()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 7 — Verification
 print("── Supply Chain Silver — Verification ──────────────────────────────")
 checks = [
