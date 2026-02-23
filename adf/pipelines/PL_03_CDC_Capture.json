@@ -1,0 +1,164 @@
+{
+    "name": "PL_03_CDC_Capture",
+    "properties": {
+        "description": "Native CDC capture from SQL Server using ADF CDC activity.\n                   Captures INSERT / UPDATE / DELETE operations since last checkpoint.\n\n                   CDC-enabled tables: customers, products (CDC enabled in create_tables.sql)\n\n                   Output format: JSON Lines to landing/cdc/{table}/{date}/\n                   Each row has: __$operation (1=Delete, 2=Insert, 3=Before, 4=After), all columns.\n\n                   ADF CDC activity tracks LSN (Log Sequence Number) checkpoint automatically —\n                   no need for manual watermark table like JDBC incremental.\n\n                   Output is consumed by:\n                   - Autoloader in 03_bronze_autoloader_json.py  (landing/cdc/ → bronze.cdc_*_raw)\n                   - DLT APPLY CHANGES                           (DLT reads bronze.cdc_*_raw → silver)",
+        "activities": [
+            {
+                "name": "CDC Customers",
+                "description": "Capture all changes to dbo.customers since last run.\n                              ADF stores CDC checkpoint in: checkpoint/adf-cdc/customers/",
+                "type": "Copy",
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "isolationLevel": "ReadCommitted",
+                        "partitionOption": "None",
+                        "enablePartitionDiscovery": false
+                    },
+                    "sink": {
+                        "type": "JsonSink",
+                        "storeSettings": {
+                            "type": "AzureBlobFSWriteSettings",
+                            "copyBehavior": "MergeFiles"
+                        },
+                        "formatSettings": {
+                            "type": "JsonWriteSettings",
+                            "filePattern": "setOfObjects"
+                        }
+                    },
+                    "enableCdc": true,
+                    "cdcPluginCode": "SqlServerCdc",
+                    "cdcNetChanges": true
+                },
+                "inputs": [{
+                    "referenceName": "DS_SqlServer_Table",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "schema_name": "dbo",
+                        "table_name": "customers"
+                    }
+                }],
+                "outputs": [{
+                    "referenceName": "DS_ADLS_Json",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "container": "landing",
+                        "folder_path": {
+                            "value": "@concat('cdc/customers/', pipeline().parameters.landing_date)",
+                            "type": "Expression"
+                        },
+                        "file_name": {
+                            "value": "@concat('cdc_customers_', formatDateTime(utcNow(), 'HHmmss'), '.json')",
+                            "type": "Expression"
+                        }
+                    }
+                }]
+            },
+            {
+                "name": "CDC Products",
+                "description": "Capture all changes to dbo.products — price changes and status changes.",
+                "type": "Copy",
+                "dependsOn": [{ "activity": "CDC Customers", "dependencyConditions": ["Succeeded", "Skipped"] }],
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "isolationLevel": "ReadCommitted",
+                        "partitionOption": "None"
+                    },
+                    "sink": {
+                        "type": "JsonSink",
+                        "storeSettings": {
+                            "type": "AzureBlobFSWriteSettings",
+                            "copyBehavior": "MergeFiles"
+                        }
+                    },
+                    "enableCdc": true,
+                    "cdcPluginCode": "SqlServerCdc",
+                    "cdcNetChanges": true
+                },
+                "inputs": [{
+                    "referenceName": "DS_SqlServer_Table",
+                    "type": "DatasetReference",
+                    "parameters": { "schema_name": "dbo", "table_name": "products" }
+                }],
+                "outputs": [{
+                    "referenceName": "DS_ADLS_Json",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "container": "landing",
+                        "folder_path": {
+                            "value": "@concat('cdc/products/', pipeline().parameters.landing_date)",
+                            "type": "Expression"
+                        },
+                        "file_name": {
+                            "value": "@concat('cdc_products_', formatDateTime(utcNow(), 'HHmmss'), '.json')",
+                            "type": "Expression"
+                        }
+                    }
+                }]
+            },
+            {
+                "name": "CDC Payments",
+                "description": "Capture payment status changes (pending→completed→refunded lifecycle).",
+                "type": "Copy",
+                "dependsOn": [{ "activity": "CDC Products", "dependencyConditions": ["Succeeded", "Skipped"] }],
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "isolationLevel": "ReadCommitted"
+                    },
+                    "sink": {
+                        "type": "JsonSink",
+                        "storeSettings": { "type": "AzureBlobFSWriteSettings", "copyBehavior": "MergeFiles" }
+                    },
+                    "enableCdc": true,
+                    "cdcPluginCode": "SqlServerCdc",
+                    "cdcNetChanges": true
+                },
+                "inputs": [{
+                    "referenceName": "DS_SqlServer_Table",
+                    "type": "DatasetReference",
+                    "parameters": { "schema_name": "dbo", "table_name": "payments" }
+                }],
+                "outputs": [{
+                    "referenceName": "DS_ADLS_Json",
+                    "type": "DatasetReference",
+                    "parameters": {
+                        "container": "landing",
+                        "folder_path": {
+                            "value": "@concat('cdc/payments/', pipeline().parameters.landing_date)",
+                            "type": "Expression"
+                        },
+                        "file_name": {
+                            "value": "@concat('cdc_payments_', formatDateTime(utcNow(), 'HHmmss'), '.json')",
+                            "type": "Expression"
+                        }
+                    }
+                }]
+            },
+            {
+                "name": "Set CDC Row Counts",
+                "type": "SetVariable",
+                "dependsOn": [
+                    { "activity": "CDC Customers", "dependencyConditions": ["Succeeded", "Skipped"] },
+                    { "activity": "CDC Products",  "dependencyConditions": ["Succeeded", "Skipped"] },
+                    { "activity": "CDC Payments",  "dependencyConditions": ["Succeeded", "Skipped"] }
+                ],
+                "typeProperties": {
+                    "variableName": "cdc_summary",
+                    "value": {
+                        "value": "@concat('customers:', string(activity('CDC Customers').output.rowsCopied), ' products:', string(activity('CDC Products').output.rowsCopied), ' payments:', string(activity('CDC Payments').output.rowsCopied))",
+                        "type": "Expression"
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "run_id":       { "type": "String" },
+            "landing_date": { "type": "String" }
+        },
+        "variables": {
+            "cdc_summary": { "type": "String", "defaultValue": "" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:cdc"]
+    }
+}

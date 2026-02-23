@@ -1,0 +1,14 @@
+{
+    "name": "LS_KeyVault",
+    "properties": {
+        "description": "Azure Key Vault — omnioc-dev-eus-kv-01. All secrets referenced from here.",
+        "type": "AzureKeyVault",
+        "typeProperties": {
+            "baseUrl": "https://omnioc-dev-eus-kv-01.vault.azure.net/"
+        },
+        "annotations": [
+            "project:omnioc-lakehouse",
+            "env:dev"
+        ]
+    }
+}

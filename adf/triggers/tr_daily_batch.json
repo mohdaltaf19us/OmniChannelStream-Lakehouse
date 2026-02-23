@@ -1,0 +1,33 @@
+{
+    "name": "tr_daily_batch",
+    "type": "Microsoft.DataFactory/factories/triggers",
+    "properties": {
+        "description": "Daily schedule trigger — fires at 01:00 UTC. Starts the master orchestrator pipeline. Paused by default in dev to avoid unintended runs; set runtimeState to Started when ready.",
+        "type": "ScheduleTrigger",
+        "typeProperties": {
+            "recurrence": {
+                "frequency": "Day",
+                "interval": 1,
+                "startTime": "2025-01-01T01:00:00Z",
+                "timeZone": "UTC",
+                "schedule": {
+                    "hours": [1],
+                    "minutes": [0]
+                }
+            }
+        },
+        "pipelines": [
+            {
+                "pipelineReference": {
+                    "referenceName": "pl_master_orchestrator",
+                    "type": "PipelineReference"
+                },
+                "parameters": {
+                    "forceFullRefresh": false
+                }
+            }
+        ],
+        "runtimeState": "Stopped",
+        "annotations": ["omnioc-lakehouse", "daily", "batch"]
+    }
+}

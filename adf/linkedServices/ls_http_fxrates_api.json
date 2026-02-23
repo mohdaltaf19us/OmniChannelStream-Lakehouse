@@ -1,0 +1,22 @@
+{
+    "name": "ls_http_fxrates_api",
+    "type": "Microsoft.DataFactory/factories/linkedservices",
+    "properties": {
+        "description": "HTTP linked service for FX exchange rate API (open.er-api.com). Anonymous auth. Used daily to pull latest exchange rates.",
+        "type": "HttpServer",
+        "typeProperties": {
+            "url": "https://open.er-api.com/",
+            "enableServerCertificateValidation": true,
+            "authenticationType": "Anonymous"
+        },
+        "connectVia": {
+            "referenceName": "AutoResolveIntegrationRuntime",
+            "type": "IntegrationRuntimeReference"
+        },
+        "annotations": [
+            "omnioc-lakehouse",
+            "http",
+            "exchange-rates"
+        ]
+    }
+}

@@ -1,0 +1,240 @@
+{
+    "name": "pl_ingest_sqlserver_to_adls",
+    "type": "Microsoft.DataFactory/factories/pipelines",
+    "properties": {
+        "description": "Metadata-driven Copy pipeline. Reads table list from a config table in SQL Server, then uses ForEach to copy each table from SQL Server → ADLS landing/ as Parquet. Supports full load and incremental (watermark-based). ForEach batchCount=4 for controlled parallelism.",
+        "activities": [
+            {
+                "name": "LookupTableConfig",
+                "description": "Read copy config from dbo.adf_copy_config — returns table list, watermark columns, load type, target paths",
+                "type": "Lookup",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:02:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 30
+                },
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "sqlReaderQuery": {
+                            "value": "SELECT\n    source_schema,\n    source_table,\n    watermark_column,\n    last_watermark_value,\n    load_type,\n    target_folder,\n    target_file_prefix,\n    is_active,\n    copy_order,\n    query_hint\nFROM [dbo].[adf_copy_config]\nWHERE is_active = 1\n  AND ('@{pipeline().parameters.loadType}' = 'full' OR load_type = '@{pipeline().parameters.loadType}')\nORDER BY copy_order ASC",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "00:01:00"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sqlserver_table",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "schemaName": "dbo",
+                            "tableName": "adf_copy_config"
+                        }
+                    },
+                    "firstRowOnly": false
+                }
+            },
+            {
+                "name": "ForEachTable",
+                "description": "Copy each configured table. batchCount=4 runs 4 tables in parallel. NOTE: SetVariable is thread-unsafe inside ForEach — results collected via AppendVariable pattern.",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "LookupTableConfig",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('LookupTableConfig').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": false,
+                    "batchCount": 4,
+                    "activities": [
+                        {
+                            "name": "CopyTableToADLS",
+                            "description": "Copy single table from SQL Server to ADLS Parquet. Uses watermark for incremental loads.",
+                            "type": "Copy",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "1.00:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 60,
+                                "secureInput": false,
+                                "secureOutput": false
+                            },
+                            "typeProperties": {
+                                "source": {
+                                    "type": "SqlServerSource",
+                                    "sqlReaderQuery": {
+                                        "value": "@if(\n  equals(item().load_type, 'incremental'),\n  concat(\n    'SELECT * FROM [', item().source_schema, '].[', item().source_table, '] ',\n    'WHERE [', item().watermark_column, '] > ''', item().last_watermark_value, ''' ',\n    'AND [', item().watermark_column, '] <= GETDATE() ',\n    coalesce(item().query_hint, '')\n  ),\n  concat(\n    'SELECT * FROM [', item().source_schema, '].[', item().source_table, '] ',\n    coalesce(item().query_hint, '')\n  )\n)",
+                                        "type": "Expression"
+                                    },
+                                    "queryTimeout": "02:00:00",
+                                    "partitionOption": "None"
+                                },
+                                "sink": {
+                                    "type": "ParquetSink",
+                                    "storeSettings": {
+                                        "type": "AzureBlobFSWriteSettings",
+                                        "copyBehavior": "FlattenHierarchy"
+                                    },
+                                    "formatSettings": {
+                                        "type": "ParquetWriteSettings"
+                                    }
+                                },
+                                "enableStaging": false,
+                                "dataIntegrationUnits": 4,
+                                "translator": {
+                                    "type": "TabularTranslator",
+                                    "typeConversion": true,
+                                    "typeConversionSettings": {
+                                        "allowDataTruncation": false,
+                                        "treatBooleanAsNumber": false
+                                    }
+                                }
+                            },
+                            "inputs": [
+                                {
+                                    "referenceName": "ds_sqlserver_table",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "schemaName": {
+                                            "value": "@item().source_schema",
+                                            "type": "Expression"
+                                        },
+                                        "tableName": {
+                                            "value": "@item().source_table",
+                                            "type": "Expression"
+                                        },
+                                        "watermarkColumn": {
+                                            "value": "@item().watermark_column",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ],
+                            "outputs": [
+                                {
+                                    "referenceName": "ds_adls_parquet_landing",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "containerName": "landing",
+                                        "folderPath": {
+                                            "value": "@concat(item().target_folder, '/', formatDateTime(pipeline().TriggerTime, 'yyyy/MM/dd'))",
+                                            "type": "Expression"
+                                        },
+                                        "fileName": {
+                                            "value": "@concat(item().target_file_prefix, '_', formatDateTime(pipeline().TriggerTime, 'yyyyMMddHHmmss'), '.parquet')",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "UpdateWatermark",
+                            "description": "After successful copy, update the watermark in config table so next incremental picks up where this one left off.",
+                            "type": "SqlServerStoredProcedure",
+                            "dependsOn": [
+                                {
+                                    "activity": "CopyTableToADLS",
+                                    "dependencyConditions": ["Succeeded"]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.00:01:00",
+                                "retry": 3
+                            },
+                            "linkedServiceName": {
+                                "referenceName": "ls_sqlserver_omnioc",
+                                "type": "LinkedServiceReference"
+                            },
+                            "typeProperties": {
+                                "storedProcedureName": "[dbo].[usp_update_watermark]",
+                                "storedProcedureParameters": {
+                                    "tableName": {
+                                        "value": {
+                                            "value": "@item().source_table",
+                                            "type": "Expression"
+                                        },
+                                        "type": "String"
+                                    },
+                                    "newWatermark": {
+                                        "value": {
+                                            "value": "@formatDateTime(pipeline().TriggerTime, 'yyyy-MM-dd HH:mm:ss')",
+                                            "type": "Expression"
+                                        },
+                                        "type": "String"
+                                    },
+                                    "rowsCopied": {
+                                        "value": {
+                                            "value": "@string(activity('CopyTableToADLS').output.rowsCopied)",
+                                            "type": "Expression"
+                                        },
+                                        "type": "String"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "ValidateCopyCount",
+                "description": "Assert at least one row was copied across all tables",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "ForEachTable",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@greater(activity('LookupTableConfig').output.count, 0)",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "SetCopyStatusSuccess",
+                            "type": "SetVariable",
+                            "typeProperties": {
+                                "variableName": "copyStatus",
+                                "value": "Success"
+                            }
+                        }
+                    ],
+                    "ifFalseActivities": [
+                        {
+                            "name": "FailNothingToCopy",
+                            "description": "No active tables configured — this is a config error",
+                            "type": "Fail",
+                            "typeProperties": {
+                                "message": "No active tables found in adf_copy_config. Check is_active flags.",
+                                "errorCode": "NO_TABLES_CONFIGURED"
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "pipelineRunDate": {
+                "type": "String"
+            },
+            "loadType": {
+                "type": "String",
+                "defaultValue": "incremental"
+            }
+        },
+        "variables": {
+            "copyStatus": {
+                "type": "String",
+                "defaultValue": "Pending"
+            }
+        },
+        "annotations": ["omnioc-lakehouse", "sql-server", "copy-activity", "metadata-driven"]
+    }
+}

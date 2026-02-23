@@ -1,0 +1,134 @@
+resources:
+  jobs:
+    batch_ingestion_job:
+      name: omnioc-${var.env}-batch-ingestion
+      description: "Daily batch ingestion: Autoloader CSV/JSON/Parquet → Bronze, then DLT Supply Chain → Silver/Gold"
+
+      # Run daily at 02:00 UTC
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"
+        timezone_id: "UTC"
+        pause_status: UNPAUSED
+
+      job_clusters:
+        - job_cluster_key: ingestion_cluster
+          new_cluster:
+            spark_version: 14.3.x-scala2.12
+            node_type_id: ${var.node_type}
+            autoscale:
+              min_workers: 2
+              max_workers: 6
+            spark_conf:
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.databricks.delta.autoCompact.enabled: "true"
+              spark.databricks.io.cache.enabled: "true"
+            custom_tags:
+              project: omnioc-lakehouse
+              env: ${var.env}
+              job: batch-ingestion
+
+      tasks:
+        # ── BRONZE INGESTION ──────────────────────────────────────────────────
+        - task_key: bronze_autoloader_csv
+          description: "Ingest CSV files from landing → Bronze"
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/ingestion/02_bronze_autoloader_csv
+            base_parameters:
+              catalog: ${var.catalog}
+              storage_account: ${var.storage_account}
+              trigger_once: "true"
+          timeout_seconds: 3600
+          retry_on_timeout: false
+
+        - task_key: bronze_autoloader_json
+          description: "Ingest JSON files from landing → Bronze"
+          depends_on:
+            - task_key: bronze_autoloader_csv
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/ingestion/03_bronze_autoloader_json
+            base_parameters:
+              catalog: ${var.catalog}
+              storage_account: ${var.storage_account}
+              trigger_once: "true"
+          timeout_seconds: 3600
+
+        - task_key: bronze_autoloader_parquet
+          description: "Ingest Parquet files from landing → Bronze"
+          depends_on:
+            - task_key: bronze_autoloader_csv
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/ingestion/04_bronze_autoloader_parquet
+            base_parameters:
+              catalog: ${var.catalog}
+              storage_account: ${var.storage_account}
+              trigger_once: "true"
+          timeout_seconds: 3600
+
+        - task_key: bronze_verification
+          description: "Verify all Bronze tables loaded correctly"
+          depends_on:
+            - task_key: bronze_autoloader_json
+            - task_key: bronze_autoloader_parquet
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/ingestion/05_bronze_verification
+            base_parameters:
+              catalog: ${var.catalog}
+          timeout_seconds: 600
+
+        # ── DLT PIPELINE TRIGGER ──────────────────────────────────────────────
+        - task_key: trigger_supply_chain_dlt
+          description: "Trigger Supply Chain DLT pipeline update"
+          depends_on:
+            - task_key: bronze_verification
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.supply_chain_dlt.id}
+            full_refresh: false
+
+        # ── GOLD LAYER ────────────────────────────────────────────────────────
+        - task_key: gold_dimensional
+          description: "Build Gold dimensional model"
+          depends_on:
+            - task_key: trigger_supply_chain_dlt
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/data_models/dimensional/gold_dimensional_model
+            base_parameters:
+              catalog: ${var.catalog}
+          timeout_seconds: 3600
+
+        - task_key: gold_data_vault
+          description: "Build Gold Data Vault 2.0 layer"
+          depends_on:
+            - task_key: trigger_supply_chain_dlt
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/data_models/data_vault/gold_data_vault
+            base_parameters:
+              catalog: ${var.catalog}
+          timeout_seconds: 3600
+
+        - task_key: gold_big_table
+          description: "Build Gold Big Table (no-join serving layer)"
+          depends_on:
+            - task_key: gold_dimensional
+            - task_key: gold_data_vault
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/data_models/big_table/gold_big_table
+            base_parameters:
+              catalog: ${var.catalog}
+          timeout_seconds: 1800
+
+      email_notifications:
+        on_failure:
+          - data-eng@omnioc.com
+        on_success:
+          - data-eng@omnioc.com
+
+      tags:
+        project: omnioc-lakehouse
+        env: ${var.env}

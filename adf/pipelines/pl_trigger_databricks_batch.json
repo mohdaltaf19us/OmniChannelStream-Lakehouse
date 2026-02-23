@@ -1,0 +1,232 @@
+{
+    "name": "pl_trigger_databricks_batch",
+    "type": "Microsoft.DataFactory/factories/pipelines",
+    "properties": {
+        "description": "Triggers the Databricks batch ingestion job (omnioc-dev-batch-ingestion) via the Databricks Jobs REST API using a Web Activity. Polls for completion and surfaces job run URL in the activity output. ADF does not need a cluster — it calls the Databricks Job API which manages its own cluster.",
+        "activities": [
+            {
+                "name": "TriggerBatchJob",
+                "description": "POST to Databricks Jobs API to start the batch ingestion job. Uses access token from Key Vault.",
+                "type": "WebActivity",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:05:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 30
+                },
+                "typeProperties": {
+                    "method": "POST",
+                    "url": "https://adb-7405609624004172.12.azuredatabricks.net/api/2.1/jobs/run-now",
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Authorization": {
+                            "value": "@concat('Bearer ', activity('GetDatabricksToken').output.value)",
+                            "type": "Expression"
+                        }
+                    },
+                    "body": {
+                        "value": "@json(concat('{\"job_id\":', pipeline().parameters.batchJobId, ',\"notebook_params\":{\"catalog\":\"', pipeline().parameters.catalog, '\",\"run_date\":\"', pipeline().parameters.runDate, '\",\"full_refresh\":\"', string(pipeline().parameters.triggerFullRefresh), '\"}}'))",
+                        "type": "Expression"
+                    },
+                    "authentication": {
+                        "type": "MSI",
+                        "resource": "https://vault.azure.net"
+                    }
+                }
+            },
+            {
+                "name": "GetDatabricksToken",
+                "description": "Fetch Databricks access token from Key Vault at runtime",
+                "type": "WebActivity",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "url": "https://omnioc-dev-eus-kv-01.vault.azure.net/secrets/databricks-adf-access-token?api-version=7.0",
+                    "authentication": {
+                        "type": "MSI",
+                        "resource": "https://vault.azure.net"
+                    }
+                }
+            },
+            {
+                "name": "WaitForJobCompletion",
+                "description": "Poll Databricks Jobs API every 30 seconds until job completes. Timeout = 3 hours.",
+                "type": "Until",
+                "dependsOn": [
+                    {
+                        "activity": "TriggerBatchJob",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@or(\n  equals(variables('jobState'), 'TERMINATED'),\n  equals(variables('jobState'), 'SKIPPED'),\n  equals(variables('jobState'), 'INTERNAL_ERROR'),\n  greater(variables('pollCount'), 360)\n)",
+                        "type": "Expression"
+                    },
+                    "timeout": "03:00:00",
+                    "activities": [
+                        {
+                            "name": "WaitBetweenPolls",
+                            "type": "Wait",
+                            "dependsOn": [],
+                            "typeProperties": {
+                                "waitTimeInSeconds": 30
+                            }
+                        },
+                        {
+                            "name": "PollJobStatus",
+                            "description": "GET run status from Databricks Jobs API",
+                            "type": "WebActivity",
+                            "dependsOn": [
+                                {
+                                    "activity": "WaitBetweenPolls",
+                                    "dependencyConditions": ["Succeeded"]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.00:01:00",
+                                "retry": 3
+                            },
+                            "typeProperties": {
+                                "method": "GET",
+                                "url": {
+                                    "value": "@concat('https://adb-7405609624004172.12.azuredatabricks.net/api/2.1/jobs/runs/get?run_id=', activity('TriggerBatchJob').output.run_id)",
+                                    "type": "Expression"
+                                },
+                                "headers": {
+                                    "Authorization": {
+                                        "value": "@concat('Bearer ', activity('GetDatabricksToken').output.value)",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "name": "UpdateJobState",
+                            "type": "SetVariable",
+                            "dependsOn": [
+                                {
+                                    "activity": "PollJobStatus",
+                                    "dependencyConditions": ["Succeeded"]
+                                }
+                            ],
+                            "typeProperties": {
+                                "variableName": "jobState",
+                                "value": {
+                                    "value": "@activity('PollJobStatus').output.state.life_cycle_state",
+                                    "type": "Expression"
+                                }
+                            }
+                        },
+                        {
+                            "name": "IncrementPollCount",
+                            "type": "SetVariable",
+                            "dependsOn": [
+                                {
+                                    "activity": "UpdateJobState",
+                                    "dependencyConditions": ["Succeeded"]
+                                }
+                            ],
+                            "typeProperties": {
+                                "variableName": "pollCount",
+                                "value": {
+                                    "value": "@add(variables('pollCount'), 1)",
+                                    "type": "Expression"
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "CheckJobResult",
+                "description": "Assert job ended in SUCCESS state, not INTERNAL_ERROR",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "WaitForJobCompletion",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@equals(variables('jobState'), 'TERMINATED')",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "CheckResultState",
+                            "description": "Verify result state is SUCCESS (not FAILED or CANCELED)",
+                            "type": "IfCondition",
+                            "dependsOn": [],
+                            "typeProperties": {
+                                "expression": {
+                                    "value": "@not(equals(activity('PollJobStatus').output.state.result_state, 'SUCCESS'))",
+                                    "type": "Expression"
+                                },
+                                "ifTrueActivities": [
+                                    {
+                                        "name": "FailDatabricksJobFailed",
+                                        "type": "Fail",
+                                        "typeProperties": {
+                                            "message": {
+                                                "value": "@concat('Databricks job failed. Result state: ', activity('PollJobStatus').output.state.result_state, '. Run URL: ', activity('PollJobStatus').output.run_page_url)",
+                                                "type": "Expression"
+                                            },
+                                            "errorCode": "DATABRICKS_JOB_FAILED"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "ifFalseActivities": [
+                        {
+                            "name": "FailJobTimeout",
+                            "type": "Fail",
+                            "typeProperties": {
+                                "message": {
+                                    "value": "@concat('Databricks job did not complete within timeout. Last state: ', variables('jobState'))",
+                                    "type": "Expression"
+                                },
+                                "errorCode": "DATABRICKS_JOB_TIMEOUT"
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "batchJobId": {
+                "type": "int",
+                "defaultValue": 0
+            },
+            "catalog": {
+                "type": "String",
+                "defaultValue": "omnioc_dev"
+            },
+            "runDate": {
+                "type": "String"
+            },
+            "triggerFullRefresh": {
+                "type": "bool",
+                "defaultValue": false
+            }
+        },
+        "variables": {
+            "jobState": {
+                "type": "String",
+                "defaultValue": "PENDING"
+            },
+            "pollCount": {
+                "type": "Integer",
+                "defaultValue": 0
+            }
+        },
+        "annotations": ["omnioc-lakehouse", "databricks", "job-trigger", "polling"]
+    }
+}

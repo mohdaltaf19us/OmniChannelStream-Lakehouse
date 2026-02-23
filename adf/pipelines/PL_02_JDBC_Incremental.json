@@ -1,0 +1,158 @@
+{
+    "name": "PL_02_JDBC_Incremental",
+    "properties": {
+        "description": "Watermark-based incremental load from SQL Server.\n                   Pattern: Lookup(current watermark) → Copy(WHERE updated_at > watermark) → SP(update watermark)\n\n                   Tables processed:\n                   - dbo.orders      (watermark col: updated_at)\n                   - dbo.payments    (watermark col: updated_at)\n                   - dbo.inventory   (watermark col: updated_at)\n                   - dbo.shipments   (watermark col: created_at  — append only)\n\n                   Watermark state stored in: dbo.adf_watermark_control\n                   Output: landing/{domain}/{table}/{date}/incremental_{timestamp}.parquet\n\n                   NOTE: ADF ForEach cannot be nested.\n                   Each table runs sequentially (isSequential: true) to avoid watermark race conditions.",
+        "activities": [
+            {
+                "name": "ForEach Incremental Table",
+                "type": "ForEach",
+                "typeProperties": {
+                    "items": {
+                        "value": "@pipeline().parameters.tables_config",
+                        "type": "Expression"
+                    },
+                    "isSequential": true,
+                    "activities": [
+                        {
+                            "name": "Lookup Current Watermark",
+                            "description": "Read last_loaded_at from watermark control table for this source table.",
+                            "type": "Lookup",
+                            "typeProperties": {
+                                "source": {
+                                    "type": "SqlServerSource",
+                                    "sqlReaderQuery": {
+                                        "value": "@concat('SELECT last_loaded_at, watermark_col FROM dbo.adf_watermark_control WHERE source_schema = ''', item().schema_name, ''' AND source_table = ''', item().table_name, '''')",
+                                        "type": "Expression"
+                                    }
+                                },
+                                "dataset": {
+                                    "referenceName": "DS_SqlServer_Watermark",
+                                    "type": "DatasetReference"
+                                },
+                                "firstRowOnly": true
+                            }
+                        },
+                        {
+                            "name": "Get High Watermark",
+                            "description": "Get max(updated_at) from source to know the new watermark ceiling.",
+                            "type": "Lookup",
+                            "dependsOn": [{ "activity": "Lookup Current Watermark", "dependencyConditions": ["Succeeded"] }],
+                            "typeProperties": {
+                                "source": {
+                                    "type": "SqlServerSource",
+                                    "sqlReaderQuery": {
+                                        "value": "@concat('SELECT MAX(', activity('Lookup Current Watermark').output.firstRow.watermark_col, ') AS high_watermark FROM ', item().schema_name, '.', item().table_name)",
+                                        "type": "Expression"
+                                    }
+                                },
+                                "dataset": {
+                                    "referenceName": "DS_SqlServer_Watermark",
+                                    "type": "DatasetReference"
+                                },
+                                "firstRowOnly": true
+                            }
+                        },
+                        {
+                            "name": "Copy Incremental Data",
+                            "description": "Copy rows WHERE watermark_col > last_loaded_at AND <= high_watermark.\n                              Using both bounds makes the window idempotent (safe to re-run).",
+                            "type": "Copy",
+                            "dependsOn": [{ "activity": "Get High Watermark", "dependencyConditions": ["Succeeded"] }],
+                            "typeProperties": {
+                                "source": {
+                                    "type": "SqlServerSource",
+                                    "sqlReaderQuery": {
+                                        "value": "@concat('SELECT * FROM ', item().schema_name, '.', item().table_name, ' WHERE ', activity('Lookup Current Watermark').output.firstRow.watermark_col, ' > ''', activity('Lookup Current Watermark').output.firstRow.last_loaded_at, ''' AND ', activity('Lookup Current Watermark').output.firstRow.watermark_col, ' <= ''', activity('Get High Watermark').output.firstRow.high_watermark, '''')",
+                                        "type": "Expression"
+                                    },
+                                    "queryTimeout": "02:00:00"
+                                },
+                                "sink": {
+                                    "type": "ParquetSink",
+                                    "storeSettings": {
+                                        "type": "AzureBlobFSWriteSettings",
+                                        "copyBehavior": "MergeFiles"
+                                    }
+                                },
+                                "enableStaging": false,
+                                "skipErrorFile": {
+                                    "fileMissing": true
+                                }
+                            },
+                            "inputs": [{
+                                "referenceName": "DS_SqlServer_Table",
+                                "type": "DatasetReference",
+                                "parameters": {
+                                    "schema_name": { "value": "@item().schema_name", "type": "Expression" },
+                                    "table_name":  { "value": "@item().table_name",  "type": "Expression" }
+                                }
+                            }],
+                            "outputs": [{
+                                "referenceName": "DS_ADLS_Parquet",
+                                "type": "DatasetReference",
+                                "parameters": {
+                                    "container":   "landing",
+                                    "folder_path": {
+                                        "value": "@concat(item().domain, '/', item().table_name, '/', formatDateTime(utcNow(), 'yyyy-MM-dd'))",
+                                        "type": "Expression"
+                                    },
+                                    "file_name":   {
+                                        "value": "@concat(item().table_name, '_incr_', formatDateTime(utcNow(), 'HHmmss'), '.parquet')",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }]
+                        },
+                        {
+                            "name": "Update Watermark",
+                            "description": "Advance watermark to high_watermark. Only runs if Copy succeeded.\n                              Uses stored procedure to ensure atomicity.",
+                            "type": "SqlServerStoredProcedure",
+                            "dependsOn": [{ "activity": "Copy Incremental Data", "dependencyConditions": ["Succeeded"] }],
+                            "linkedServiceName": {
+                                "referenceName": "LS_SqlServer_OnPrem",
+                                "type": "LinkedServiceReference"
+                            },
+                            "typeProperties": {
+                                "storedProcedureName": "dbo.usp_update_watermark",
+                                "storedProcedureParameters": {
+                                    "source_schema":    { "value": { "value": "@item().schema_name", "type": "Expression" }, "type": "String" },
+                                    "source_table":     { "value": { "value": "@item().table_name",  "type": "Expression" }, "type": "String" },
+                                    "new_watermark":    { "value": { "value": "@activity('Get High Watermark').output.firstRow.high_watermark", "type": "Expression" }, "type": "DateTime" },
+                                    "rows_loaded":      { "value": { "value": "@activity('Copy Incremental Data').output.rowsCopied", "type": "Expression" }, "type": "Int64" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "Skip If No New Data",
+                            "description": "If no rows were copied, log it but don't fail.",
+                            "type": "SetVariable",
+                            "dependsOn": [{ "activity": "Copy Incremental Data", "dependencyConditions": ["Skipped", "Failed"] }],
+                            "typeProperties": {
+                                "variableName": "skipped_tables",
+                                "value": {
+                                    "value": "@concat(variables('skipped_tables'), item().table_name, ',')",
+                                    "type": "Expression"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "run_id": { "type": "String" },
+            "tables_config": {
+                "type": "Array",
+                "defaultValue": [
+                    { "schema_name": "dbo", "table_name": "orders",    "domain": "finance",       "watermark_col": "updated_at" },
+                    { "schema_name": "dbo", "table_name": "payments",  "domain": "finance",       "watermark_col": "updated_at" },
+                    { "schema_name": "dbo", "table_name": "inventory", "domain": "supply_chain",  "watermark_col": "updated_at" },
+                    { "schema_name": "dbo", "table_name": "order_line_items", "domain": "finance", "watermark_col": "updated_at" }
+                ]
+            }
+        },
+        "variables": {
+            "skipped_tables": { "type": "String", "defaultValue": "" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:incremental-watermark"]
+    }
+}

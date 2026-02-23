@@ -1,0 +1,94 @@
+{
+    "name": "PL_06_DQ_Gate",
+    "properties": {
+        "description": "Data Quality gate pipeline — runs DQ validation notebook after every load.\n\n                   Flow:\n                   1. Run DQ validation notebook (dq_validation.py)\n                   2. Read DQ results from Delta table (omnioc_dev.bronze.dq_validation_results)\n                   3. IfCondition: any CRITICAL failures? → fail pipeline + alert\n                   4. If no CRITICAL: check HIGH severity count → warn but continue\n                   5. Write DQ run summary to pipeline log variable\n\n                   This is the quality gate between ingestion and Gold model building.\n                   The master pipeline will NOT proceed to Gold if this fails.\n\n                   DQ results stored in: omnioc_dev.bronze.dq_validation_results\n                   Alerting: calls PL_07_Alerting with DQ failure details.",
+        "activities": [
+            {
+                "name": "Run DQ Validation Notebook",
+                "description": "Execute DQ validation across all Bronze and Silver tables.\n                              Notebook raises AssertionError if CRITICAL checks fail — ADF catches this.",
+                "type": "DatabricksNotebook",
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/data_quality/great_expectations/dq_validation",
+                    "baseParameters": {
+                        "catalog": { "value": "@pipeline().parameters.catalog", "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Read DQ Result Summary",
+                "description": "Lookup latest DQ run results — count critical failures from Delta table.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Run DQ Validation Notebook", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/data_quality/great_expectations/dq_validation",
+                    "baseParameters": {
+                        "catalog":  { "value": "@pipeline().parameters.catalog", "type": "Expression" },
+                        "mode":     "summary_only"
+                    }
+                }
+            },
+            {
+                "name": "DQ Passed — Set Status",
+                "description": "DQ validation passed — record success in pipeline variable.",
+                "type": "SetVariable",
+                "dependsOn": [{ "activity": "Read DQ Result Summary", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "variableName": "dq_status",
+                    "value": {
+                        "value": "@concat('PASSED — run_id:', pipeline().parameters.run_id, ' at ', utcNow())",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "DQ Failed — Raise Alert",
+                "description": "If DQ notebook threw error (CRITICAL checks failed), trigger alerting pipeline.",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Run DQ Validation Notebook", "dependencyConditions": ["Failed"] }],
+                "typeProperties": {
+                    "pipeline": {
+                        "referenceName": "PL_07_Alerting",
+                        "type": "PipelineReference"
+                    },
+                    "waitOnCompletion": false,
+                    "parameters": {
+                        "pipeline_name": "PL_06_DQ_Gate",
+                        "failure_reason": "CRITICAL DQ checks failed — Gold model build blocked",
+                        "run_id":        { "value": "@pipeline().parameters.run_id", "type": "Expression" },
+                        "severity":      "CRITICAL"
+                    }
+                }
+            },
+            {
+                "name": "DQ Failed — Propagate Failure",
+                "description": "Re-raise failure so master pipeline knows DQ gate failed.",
+                "type": "Fail",
+                "dependsOn": [{ "activity": "DQ Failed — Raise Alert", "dependencyConditions": ["Succeeded", "Failed", "Skipped"] }],
+                "typeProperties": {
+                    "message": {
+                        "value": "@concat('DQ Gate FAILED for run_id: ', pipeline().parameters.run_id, '. Check omnioc_dev.bronze.dq_validation_results for details.')",
+                        "type": "Expression"
+                    },
+                    "errorCode": "DQ_GATE_FAILED"
+                }
+            }
+        ],
+        "parameters": {
+            "run_id":  { "type": "String" },
+            "catalog": { "type": "String", "defaultValue": "omnioc_dev" }
+        },
+        "variables": {
+            "dq_status":         { "type": "String", "defaultValue": "" },
+            "critical_failures": { "type": "String", "defaultValue": "0" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:dq-gate"]
+    }
+}

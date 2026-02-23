@@ -1,0 +1,31 @@
+{
+    "name": "TR_Weekly_Sunday_Optimize",
+    "properties": {
+        "description": "Weekly schedule trigger — fires every Sunday at 03:00 UTC.\n                   Triggers Delta Lake OPTIMIZE + VACUUM maintenance pipeline.\n                   Runs after daily batch window closes (02:00 UTC) to avoid contention.",
+        "type": "ScheduleTrigger",
+        "typeProperties": {
+            "recurrence": {
+                "frequency": "Week",
+                "interval": 1,
+                "startTime": "2024-01-07T03:00:00Z",
+                "timeZone": "UTC",
+                "schedule": {
+                    "weekDays": ["Sunday"],
+                    "hours": [3],
+                    "minutes": [0]
+                }
+            }
+        },
+        "pipelines": [{
+            "pipelineReference": {
+                "referenceName": "PL_09_Delta_Optimize",
+                "type": "PipelineReference"
+            },
+            "parameters": {
+                "catalog": "omnioc_dev"
+            }
+        }],
+        "runtimeState": "Stopped",
+        "annotations": ["project:omnioc-lakehouse", "schedule:weekly-maintenance"]
+    }
+}

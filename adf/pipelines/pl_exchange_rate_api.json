@@ -1,0 +1,109 @@
+{
+    "name": "pl_exchange_rate_api",
+    "type": "Microsoft.DataFactory/factories/pipelines",
+    "properties": {
+        "description": "Fetches live exchange rates from open.er-api.com for USD, EUR, GBP base currencies. Lands as JSON in ADLS landing/finance/exchange_rates/{date}/. Databricks Autoloader picks these up on the next run. Runs daily as part of master orchestrator — no direct trigger.",
+        "activities": [
+            {
+                "name": "ForEachBaseCurrency",
+                "description": "Fetch rates for each base currency. Sequential to respect API rate limits.",
+                "type": "ForEach",
+                "dependsOn": [],
+                "typeProperties": {
+                    "items": {
+                        "value": "@pipeline().parameters.baseCurrencies",
+                        "type": "Expression"
+                    },
+                    "isSequential": true,
+                    "activities": [
+                        {
+                            "name": "FetchRatesFromAPI",
+                            "description": "HTTP GET to open.er-api.com for one base currency",
+                            "type": "Copy",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "0.00:05:00",
+                                "retry": 3,
+                                "retryIntervalInSeconds": 30
+                            },
+                            "typeProperties": {
+                                "source": {
+                                    "type": "JsonSource",
+                                    "storeSettings": {
+                                        "type": "HttpReadSettings",
+                                        "requestMethod": "GET",
+                                        "additionalHeaders": "Accept: application/json",
+                                        "requestTimeout": "00:02:00"
+                                    }
+                                },
+                                "sink": {
+                                    "type": "JsonSink",
+                                    "storeSettings": {
+                                        "type": "AzureBlobFSWriteSettings"
+                                    },
+                                    "formatSettings": {
+                                        "type": "JsonWriteSettings",
+                                        "filePattern": "setOfObjects"
+                                    }
+                                },
+                                "enableStaging": false
+                            },
+                            "inputs": [
+                                {
+                                    "referenceName": "ds_http_fxrates",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "baseCurrency": {
+                                            "value": "@item()",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ],
+                            "outputs": [
+                                {
+                                    "referenceName": "ds_adls_json_landing",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "folderPath": {
+                                            "value": "@concat('finance/exchange_rates/', formatDateTime(pipeline().TriggerTime, 'yyyy/MM/dd'))",
+                                            "type": "Expression"
+                                        },
+                                        "fileName": {
+                                            "value": "@concat('fx_', item(), '_', formatDateTime(pipeline().TriggerTime, 'yyyyMMdd'), '.json')",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "WaitBetweenCurrencies",
+                            "description": "Brief pause to respect open.er-api.com free tier rate limits",
+                            "type": "Wait",
+                            "dependsOn": [
+                                {
+                                    "activity": "FetchRatesFromAPI",
+                                    "dependencyConditions": ["Succeeded"]
+                                }
+                            ],
+                            "typeProperties": {
+                                "waitTimeInSeconds": 2
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "baseCurrencies": {
+                "type": "Array",
+                "defaultValue": ["USD", "EUR", "GBP"]
+            },
+            "rateDate": {
+                "type": "String"
+            }
+        },
+        "annotations": ["omnioc-lakehouse", "http", "exchange-rates", "finance"]
+    }
+}

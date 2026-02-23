@@ -1,0 +1,153 @@
+{
+    "name": "PL_00_Master_Daily_Orchestrator",
+    "properties": {
+        "description": "Master pipeline — runs daily at 02:00 UTC.\n\n                   Execution order:\n                   1. Full load (warehouses, products, suppliers)     ← parallel\n                   2. Incremental JDBC (orders, payments, inventory)  ← parallel\n                   3. CDC capture (customers, products changes)        ← parallel with 2\n                   4. Trigger Databricks batch job                    ← waits for 1+2+3\n                   5. DQ gate validation                              ← waits for 4\n                   6. Success notification                            ← if all pass\n\n                   On any failure: PL_07_Alerting is called via IfCondition.",
+        "activities": [
+            {
+                "name": "Set RunId",
+                "type": "SetVariable",
+                "typeProperties": {
+                    "variableName": "run_id",
+                    "value": {
+                        "value": "@concat('RUN-', formatDateTime(utcNow(), 'yyyyMMdd-HHmmss'))",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "Log Pipeline Start",
+                "type": "SetVariable",
+                "dependsOn": [{ "activity": "Set RunId", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "variableName": "pipeline_start",
+                    "value": { "value": "@utcNow()", "type": "Expression" }
+                }
+            },
+            {
+                "name": "Execute Full Load",
+                "description": "Full reload of small dimension tables (warehouses, exchange_rates)",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Log Pipeline Start", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "pipeline": { "referenceName": "PL_01_JDBC_Full_Load", "type": "PipelineReference" },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "run_id":       { "value": "@variables('run_id')", "type": "Expression" },
+                        "landing_date": { "value": "@formatDateTime(utcNow(), 'yyyy-MM-dd')", "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Execute Incremental JDBC",
+                "description": "Watermark-based incremental load (orders, shipments, payments, inventory)",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Log Pipeline Start", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "pipeline": { "referenceName": "PL_02_JDBC_Incremental", "type": "PipelineReference" },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "run_id": { "value": "@variables('run_id')", "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Execute CDC Capture",
+                "description": "CDC change capture for customers and products",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Log Pipeline Start", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "pipeline": { "referenceName": "PL_03_CDC_Capture", "type": "PipelineReference" },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "run_id":       { "value": "@variables('run_id')", "type": "Expression" },
+                        "landing_date": { "value": "@formatDateTime(utcNow(), 'yyyy-MM-dd')", "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Check Ingestion Success",
+                "description": "Gate: only proceed to Databricks if all ingestion pipelines succeeded",
+                "type": "IfCondition",
+                "dependsOn": [
+                    { "activity": "Execute Full Load",       "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Execute Incremental JDBC","dependencyConditions": ["Succeeded"] },
+                    { "activity": "Execute CDC Capture",     "dependencyConditions": ["Succeeded"] }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@and(equals(activity('Execute Full Load').Status,'Succeeded'), and(equals(activity('Execute Incremental JDBC').Status,'Succeeded'), equals(activity('Execute CDC Capture').Status,'Succeeded')))",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "Trigger Databricks Batch",
+                            "type": "ExecutePipeline",
+                            "typeProperties": {
+                                "pipeline": { "referenceName": "PL_05_Trigger_Databricks_Batch", "type": "PipelineReference" },
+                                "waitOnCompletion": true,
+                                "parameters": {
+                                    "run_id":           { "value": "@variables('run_id')", "type": "Expression" },
+                                    "trigger_once":     "true",
+                                    "full_refresh":     "false"
+                                }
+                            }
+                        }
+                    ],
+                    "ifFalseActivities": [
+                        {
+                            "name": "Alert Ingestion Failed",
+                            "type": "ExecutePipeline",
+                            "typeProperties": {
+                                "pipeline": { "referenceName": "PL_07_Alerting", "type": "PipelineReference" },
+                                "waitOnCompletion": false,
+                                "parameters": {
+                                    "pipeline_name": "PL_00_Master_Daily_Orchestrator",
+                                    "failure_reason": "One or more ingestion pipelines failed",
+                                    "run_id":         { "value": "@variables('run_id')", "type": "Expression" },
+                                    "severity":       "HIGH"
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "Execute DQ Gate",
+                "description": "Run DQ validation notebook — fails master pipeline if critical issues found",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Check Ingestion Success", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "pipeline": { "referenceName": "PL_06_DQ_Gate", "type": "PipelineReference" },
+                    "waitOnCompletion": true,
+                    "parameters": {
+                        "run_id":   { "value": "@variables('run_id')", "type": "Expression" },
+                        "catalog":  "omnioc_dev"
+                    }
+                }
+            },
+            {
+                "name": "Send Success Notification",
+                "type": "ExecutePipeline",
+                "dependsOn": [{ "activity": "Execute DQ Gate", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "pipeline": { "referenceName": "PL_07_Alerting", "type": "PipelineReference" },
+                    "waitOnCompletion": false,
+                    "parameters": {
+                        "pipeline_name": "PL_00_Master_Daily_Orchestrator",
+                        "failure_reason": "",
+                        "run_id":         { "value": "@variables('run_id')", "type": "Expression" },
+                        "severity":       "SUCCESS"
+                    }
+                }
+            }
+        ],
+        "variables": {
+            "run_id":          { "type": "String", "defaultValue": "" },
+            "pipeline_start":  { "type": "String", "defaultValue": "" }
+        },
+        "parameters": {
+            "full_refresh": { "type": "String", "defaultValue": "false" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "type:orchestrator"]
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "name": "LS_Databricks",
+    "properties": {
+        "description": "Azure Databricks workspace — omnioc-dev-eus-dbw-01.\n                   Uses PAT token stored in Key Vault. Cluster policy: job clusters only.",
+        "type": "AzureDatabricks",
+        "typeProperties": {
+            "domain": "https://adb-7405609624004172.12.azuredatabricks.net",
+            "accessToken": {
+                "type": "AzureKeyVaultSecret",
+                "store": {
+                    "referenceName": "LS_KeyVault",
+                    "type": "LinkedServiceReference"
+                },
+                "secretName": "databricks-pat-token"
+            },
+            "existingClusterId": "",
+            "newClusterNodeType": "Standard_DS3_v2",
+            "newClusterNumOfWorker": "1:4",
+            "newClusterSparkEnvVars": {
+                "PYSPARK_PYTHON": "/databricks/python3/bin/python3"
+            },
+            "newClusterCustomTags": {
+                "project": "omnioc-lakehouse",
+                "managed-by": "adf"
+            },
+            "newClusterSparkConf": {
+                "spark.databricks.delta.optimizeWrite.enabled": "true",
+                "spark.databricks.delta.autoCompact.enabled": "true"
+            }
+        },
+        "annotations": [
+            "project:omnioc-lakehouse",
+            "env:dev"
+        ]
+    }
+}

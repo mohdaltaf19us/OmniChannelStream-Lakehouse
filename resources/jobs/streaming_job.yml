@@ -1,0 +1,48 @@
+resources:
+  jobs:
+    streaming_job:
+      name: omnioc-${var.env}-streaming-eventhub
+      description: "Always-on Event Hubs → Bronze streaming job"
+
+      job_clusters:
+        - job_cluster_key: streaming_cluster
+          new_cluster:
+            spark_version: 14.3.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            num_workers: 2
+            spark_conf:
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.streaming.backpressure.enabled: "true"
+            custom_tags:
+              project: omnioc-lakehouse
+              env: ${var.env}
+              job: streaming
+
+      tasks:
+        - task_key: clickstream_stream
+          description: "Event Hubs clickstream → Bronze Delta streaming"
+          job_cluster_key: streaming_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/streaming/clickstream_stream
+            base_parameters:
+              catalog: ${var.catalog}
+              storage_account: ${var.storage_account}
+              secret_scope: ${var.secret_scope}
+              trigger_interval: "30 seconds"
+
+        - task_key: telemetry_stream
+          description: "Event Hubs device telemetry → Bronze Delta streaming"
+          job_cluster_key: streaming_cluster
+          notebook_task:
+            notebook_path: /Workspace/OmniOC/${bundle.target}/src/streaming/telemetry_stream
+            base_parameters:
+              catalog: ${var.catalog}
+              storage_account: ${var.storage_account}
+              secret_scope: ${var.secret_scope}
+
+      # Streaming jobs should always be retried
+      max_concurrent_runs: 1
+      tags:
+        project: omnioc-lakehouse
+        env: ${var.env}
+        type: streaming

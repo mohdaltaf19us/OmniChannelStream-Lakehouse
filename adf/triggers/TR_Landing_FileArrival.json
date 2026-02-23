@@ -1,0 +1,39 @@
+{
+    "name": "TR_Landing_FileArrival",
+    "properties": {
+        "description": "Storage Event trigger — fires when ANY new file lands in the landing/ container.\n                   Triggers Databricks batch pipeline immediately on file arrival.\n                   Useful for near-real-time batch ingestion outside the daily window.\n\n                   Use case: Finance team drops an ad-hoc order file at noon —\n                   this trigger picks it up within minutes rather than waiting for 02:00 UTC.\n\n                   Filter: only .parquet, .csv, .json files (not ADF log files or folders).",
+        "type": "BlobEventsTrigger",
+        "typeProperties": {
+            "blobPathBeginsWith": "/landing/blobs/",
+            "blobPathEndsWith": "",
+            "ignoreEmptyBlobs": true,
+            "events": ["Microsoft.Storage.BlobCreated"],
+            "scope": "/subscriptions/{subscription-id}/resourceGroups/omnioc-dev-eus-rg-01/providers/Microsoft.Storage/storageAccounts/omniocdeveusst01",
+            "blobPathFilter": {
+                "blobPathEndsWith": ".parquet",
+                "OR": [
+                    { "blobPathEndsWith": ".json" },
+                    { "blobPathEndsWith": ".csv"  }
+                ]
+            }
+        },
+        "pipelines": [{
+            "pipelineReference": {
+                "referenceName": "PL_05_Trigger_Databricks_Batch",
+                "type": "PipelineReference"
+            },
+            "parameters": {
+                "run_id": {
+                    "value": "@concat('file-arrival-', triggerBody().fileName, '-', utcNow())",
+                    "type": "Expression"
+                },
+                "catalog":         "omnioc_dev",
+                "storage_account": "omniocdeveusst01",
+                "trigger_once":    "true",
+                "full_refresh":    "false"
+            }
+        }],
+        "runtimeState": "Stopped",
+        "annotations": ["project:omnioc-lakehouse", "schedule:event-driven"]
+    }
+}

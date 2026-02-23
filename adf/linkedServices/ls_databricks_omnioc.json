@@ -1,0 +1,33 @@
+{
+    "name": "ls_databricks_omnioc",
+    "type": "Microsoft.DataFactory/factories/linkedservices",
+    "properties": {
+        "description": "Azure Databricks workspace — omnioc-dev-eus-dbw-01. Access token fetched from Key Vault. Used to trigger notebook jobs and DLT pipeline refreshes.",
+        "type": "AzureDatabricks",
+        "typeProperties": {
+            "domain": "https://adb-7405609624004172.12.azuredatabricks.net",
+            "accessToken": {
+                "type": "AzureKeyVaultSecret",
+                "store": {
+                    "referenceName": "ls_keyvault_omnioc",
+                    "type": "LinkedServiceReference"
+                },
+                "secretName": "databricks-adf-access-token"
+            },
+            "existingClusterId": {
+                "type": "Expression",
+                "value": "@pipeline().parameters.clusterId"
+            },
+            "clusterOption": "Existing"
+        },
+        "connectVia": {
+            "referenceName": "AutoResolveIntegrationRuntime",
+            "type": "IntegrationRuntimeReference"
+        },
+        "annotations": [
+            "omnioc-lakehouse",
+            "databricks",
+            "eastus"
+        ]
+    }
+}

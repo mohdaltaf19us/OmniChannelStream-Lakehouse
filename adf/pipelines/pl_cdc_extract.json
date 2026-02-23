@@ -1,0 +1,202 @@
+{
+    "name": "pl_cdc_extract",
+    "type": "Microsoft.DataFactory/factories/pipelines",
+    "properties": {
+        "description": "CDC incremental change capture from SQL Server using sys.fn_cdc_get_all_changes. Extracts INSERT/UPDATE/DELETE operations and lands them in ADLS landing/cdc/{table}/{date}/ as JSON Lines. Databricks APPLY CHANGES INTO then processes these records.",
+        "activities": [
+            {
+                "name": "GetCurrentLSN",
+                "description": "Get the current SQL Server LSN (log sequence number) — this becomes the end boundary for this extraction window",
+                "type": "Lookup",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "sqlReaderQuery": "SELECT\n    sys.fn_cdc_get_max_lsn() AS current_lsn,\n    GETDATE()               AS capture_time",
+                        "queryTimeout": "00:01:00"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sqlserver_table",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "schemaName": "dbo",
+                            "tableName": "adf_cdc_watermark"
+                        }
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "GetPreviousLSN",
+                "description": "Fetch the last successfully processed LSN from the watermark table",
+                "type": "Lookup",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:01:00",
+                    "retry": 2
+                },
+                "typeProperties": {
+                    "source": {
+                        "type": "SqlServerSource",
+                        "sqlReaderQuery": {
+                            "value": "SELECT\n    table_name,\n    last_processed_lsn,\n    last_processed_time\nFROM [dbo].[adf_cdc_watermark]\nWHERE is_active = 1\nORDER BY table_name",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "00:01:00"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sqlserver_table",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "schemaName": "dbo",
+                            "tableName": "adf_cdc_watermark"
+                        }
+                    },
+                    "firstRowOnly": false
+                }
+            },
+            {
+                "name": "ForEachCDCTable",
+                "description": "Extract CDC changes for each enabled table. batchCount=2 to avoid log reader contention.",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "GetCurrentLSN",
+                        "dependencyConditions": ["Succeeded"]
+                    },
+                    {
+                        "activity": "GetPreviousLSN",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('GetPreviousLSN').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": false,
+                    "batchCount": 2,
+                    "activities": [
+                        {
+                            "name": "ExtractCDCChanges",
+                            "description": "Copy CDC changes between previous LSN and current LSN to ADLS as JSON Lines",
+                            "type": "Copy",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "1.00:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 60
+                            },
+                            "typeProperties": {
+                                "source": {
+                                    "type": "SqlServerSource",
+                                    "sqlReaderQuery": {
+                                        "value": "@concat(\n  'SELECT ',\n  '    sys.fn_cdc_map_lsn_to_time(__$start_lsn) AS commit_timestamp,',\n  '    master.dbo.fn_varbintohexstr(__$start_lsn) AS lsn,',\n  '    CASE __$operation ',\n  '        WHEN 1 THEN ''DELETE'' ',\n  '        WHEN 2 THEN ''INSERT'' ',\n  '        WHEN 3 THEN ''UPDATE_BEFORE'' ',\n  '        WHEN 4 THEN ''UPDATE_AFTER'' ',\n  '    END AS operation,',\n  '    __$update_mask,',\n  '    * ',\n  'FROM cdc.fn_cdc_get_all_changes_dbo_', item().table_name, '(',\n  '    0x', item().last_processed_lsn, ', ',\n  '    ', activity('GetCurrentLSN').output.firstRow.current_lsn, ', ',\n  '    ''all update old''',\n  ') ',\n  'ORDER BY __$start_lsn'\n)",
+                                        "type": "Expression"
+                                    },
+                                    "queryTimeout": "01:00:00"
+                                },
+                                "sink": {
+                                    "type": "JsonSink",
+                                    "storeSettings": {
+                                        "type": "AzureBlobFSWriteSettings"
+                                    },
+                                    "formatSettings": {
+                                        "type": "JsonWriteSettings",
+                                        "filePattern": "arrayOfObjects"
+                                    }
+                                },
+                                "enableStaging": false,
+                                "dataIntegrationUnits": 2
+                            },
+                            "inputs": [
+                                {
+                                    "referenceName": "ds_sqlserver_table",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "schemaName": "cdc",
+                                        "tableName": {
+                                            "value": "@concat('fn_cdc_get_all_changes_dbo_', item().table_name)",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ],
+                            "outputs": [
+                                {
+                                    "referenceName": "ds_adls_json_landing",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "folderPath": {
+                                            "value": "@concat('cdc/', item().table_name, '/', formatDateTime(pipeline().TriggerTime, 'yyyy/MM/dd'))",
+                                            "type": "Expression"
+                                        },
+                                        "fileName": {
+                                            "value": "@concat('cdc_', item().table_name, '_', formatDateTime(pipeline().TriggerTime, 'yyyyMMdd_HHmmss'), '.json')",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "name": "UpdateCDCWatermark",
+                            "description": "Save the new processed LSN after successful extraction",
+                            "type": "SqlServerStoredProcedure",
+                            "dependsOn": [
+                                {
+                                    "activity": "ExtractCDCChanges",
+                                    "dependencyConditions": ["Succeeded"]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.00:01:00",
+                                "retry": 3
+                            },
+                            "linkedServiceName": {
+                                "referenceName": "ls_sqlserver_omnioc",
+                                "type": "LinkedServiceReference"
+                            },
+                            "typeProperties": {
+                                "storedProcedureName": "[dbo].[usp_update_cdc_watermark]",
+                                "storedProcedureParameters": {
+                                    "tableName": {
+                                        "value": {
+                                            "value": "@item().table_name",
+                                            "type": "Expression"
+                                        },
+                                        "type": "String"
+                                    },
+                                    "newLSN": {
+                                        "value": {
+                                            "value": "@activity('GetCurrentLSN').output.firstRow.current_lsn",
+                                            "type": "Expression"
+                                        },
+                                        "type": "String"
+                                    },
+                                    "rowsExtracted": {
+                                        "value": {
+                                            "value": "@string(activity('ExtractCDCChanges').output.rowsCopied)",
+                                            "type": "Expression"
+                                        },
+                                        "type": "String"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "extractDate": {
+                "type": "String"
+            }
+        },
+        "annotations": ["omnioc-lakehouse", "cdc", "sql-server", "incremental"]
+    }
+}

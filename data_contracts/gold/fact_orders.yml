@@ -1,0 +1,80 @@
+table: omnioc_dev.gold.fact_orders
+version: "1.0"
+owner: platform_team
+contact: platform-data@omnioc.com
+description: "Gold fact table — transactional orders with surrogate keys and denormalized dims. One row per order."
+update_frequency: daily
+sla_freshness_hours: 26
+
+columns:
+  - name: order_id
+    type: STRING
+    nullable: false
+    description: "Degenerate dimension — natural order key"
+
+  - name: customer_sk
+    type: STRING
+    nullable: false
+    description: "Surrogate key — MD5 of customer_id"
+
+  - name: order_date_key
+    type: INTEGER
+    nullable: false
+    description: "Date dimension key — YYYYMMDD integer"
+    constraints:
+      min: 20200101
+      max: 20301231
+
+  - name: total_amount
+    type: DOUBLE
+    nullable: false
+    constraints:
+      min: 0.01
+
+  - name: net_revenue
+    type: DOUBLE
+    nullable: true
+    constraints:
+      min: 0.0
+
+  - name: status
+    type: STRING
+    nullable: false
+    constraints:
+      allowed_values: [placed, confirmed, processing, shipped, delivered, cancelled, returned]
+
+  - name: currency
+    type: STRING
+    nullable: true
+
+  - name: days_to_ship
+    type: INTEGER
+    nullable: true
+    constraints:
+      min: 0
+      max: 365
+
+  - name: days_to_deliver
+    type: INTEGER
+    nullable: true
+    constraints:
+      min: 0
+      max: 730
+
+quality_rules:
+  - rule: sk_not_null
+    expression: "customer_sk IS NOT NULL"
+    severity: CRITICAL
+
+  - rule: no_negative_revenue
+    expression: "total_amount >= 0"
+    severity: CRITICAL
+
+  - rule: valid_date_key
+    expression: "order_date_key >= 20200101 AND order_date_key <= 20301231"
+    severity: HIGH
+
+breaking_changes:
+  - "Removing or renaming order_id, customer_sk, total_amount"
+  - "Changing the grain (one row per order must be maintained)"
+  - "Changing date_key format from YYYYMMDD"

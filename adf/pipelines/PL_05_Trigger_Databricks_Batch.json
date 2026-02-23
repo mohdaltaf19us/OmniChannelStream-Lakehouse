@@ -1,0 +1,177 @@
+{
+    "name": "PL_05_Trigger_Databricks_Batch",
+    "properties": {
+        "description": "Triggers the Databricks batch ingestion job (Bronze Autoloader notebooks) then waits for completion.\n\n                   Flow:\n                   1. Trigger Databricks Job by name (batch_ingestion_job)\n                   2. Poll job run status every 60 seconds (Until activity)\n                   3. IfCondition: success → proceed | failure → raise error\n                   4. Trigger DLT pipelines: Supply Chain first, then Clickstream in parallel\n                   5. Trigger Gold models: Dimensional + Data Vault in parallel, then Big Table\n\n                   Parameters allow full_refresh flag to be passed through from master.\n                   Uses Databricks linked service — job cluster auto-created per run.",
+        "activities": [
+            {
+                "name": "Run Databricks Bronze Job",
+                "description": "Submit the omnioc-dev-batch-ingestion job to Databricks.\n                              Returns a run_id that is polled in the Until loop.",
+                "type": "DatabricksNotebook",
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/ingestion/05_bronze_verification",
+                    "baseParameters": {
+                        "catalog":         "omnioc_dev",
+                        "trigger_once":    "true",
+                        "storage_account": "omniocdeveusst01"
+                    },
+                    "libraries": []
+                }
+            },
+            {
+                "name": "Run Bronze CSV Autoloader",
+                "description": "Autoloader — CSV files from landing → Bronze",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Run Databricks Bronze Job", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/ingestion/02_bronze_autoloader_csv",
+                    "baseParameters": {
+                        "catalog":         { "value": "@pipeline().parameters.catalog",         "type": "Expression" },
+                        "storage_account": { "value": "@pipeline().parameters.storage_account", "type": "Expression" },
+                        "trigger_once":    "true"
+                    }
+                }
+            },
+            {
+                "name": "Run Bronze JSON Autoloader",
+                "description": "Autoloader — JSON files (customers, orders, contracts, CDC) → Bronze",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Run Databricks Bronze Job", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/ingestion/03_bronze_autoloader_json",
+                    "baseParameters": {
+                        "catalog":         { "value": "@pipeline().parameters.catalog",         "type": "Expression" },
+                        "storage_account": { "value": "@pipeline().parameters.storage_account", "type": "Expression" },
+                        "trigger_once":    "true"
+                    }
+                }
+            },
+            {
+                "name": "Run Bronze Parquet Autoloader",
+                "description": "Autoloader — Parquet shipments → Bronze",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Run Databricks Bronze Job", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/ingestion/04_bronze_autoloader_parquet",
+                    "baseParameters": {
+                        "catalog":         { "value": "@pipeline().parameters.catalog",         "type": "Expression" },
+                        "storage_account": { "value": "@pipeline().parameters.storage_account", "type": "Expression" },
+                        "trigger_once":    "true"
+                    }
+                }
+            },
+            {
+                "name": "Bronze Verification Gate",
+                "description": "Run verification notebook — raises assertion error if row counts below minimum.\n                              ADF will catch the notebook failure and propagate to master pipeline.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [
+                    { "activity": "Run Bronze CSV Autoloader",     "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Run Bronze JSON Autoloader",    "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Run Bronze Parquet Autoloader", "dependencyConditions": ["Succeeded"] }
+                ],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/ingestion/05_bronze_verification",
+                    "baseParameters": {
+                        "catalog": { "value": "@pipeline().parameters.catalog", "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Run Supply Chain DLT",
+                "description": "Trigger Supply Chain DLT pipeline update (SQL declarative).\n                              Uses Databricks Pipeline activity — native DLT support in ADF.",
+                "type": "DatabricksSparkPython",
+                "dependsOn": [{ "activity": "Bronze Verification Gate", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "pythonFile": "dbfs:/Workspace/OmniOC/dev/scripts/trigger_dlt.py",
+                    "parameters": [
+                        { "value": "@pipeline().parameters.catalog",      "type": "Expression" },
+                        { "value": "@pipeline().parameters.full_refresh",  "type": "Expression" },
+                        "supply_chain_dlt"
+                    ]
+                }
+            },
+            {
+                "name": "Run Gold Dimensional Model",
+                "description": "Build Gold dimensional star schema tables.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Run Supply Chain DLT", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/data_models/dimensional/gold_dimensional_model",
+                    "baseParameters": {
+                        "catalog": { "value": "@pipeline().parameters.catalog", "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Run Gold Data Vault",
+                "description": "Build Gold Data Vault 2.0 (hubs, links, satellites, PIT).\n                              Runs in parallel with Dimensional model — independent.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [{ "activity": "Run Supply Chain DLT", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/data_models/data_vault/gold_data_vault",
+                    "baseParameters": {
+                        "catalog": { "value": "@pipeline().parameters.catalog", "type": "Expression" }
+                    }
+                }
+            },
+            {
+                "name": "Run Gold Big Table",
+                "description": "Build Gold Big Table serving layer — requires dimensional + DV to be ready.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [
+                    { "activity": "Run Gold Dimensional Model", "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Run Gold Data Vault",        "dependencyConditions": ["Succeeded"] }
+                ],
+                "linkedServiceName": {
+                    "referenceName": "LS_Databricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Workspace/OmniOC/dev/src/data_models/big_table/gold_big_table",
+                    "baseParameters": {
+                        "catalog": { "value": "@pipeline().parameters.catalog", "type": "Expression" }
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "run_id":          { "type": "String" },
+            "catalog":         { "type": "String", "defaultValue": "omnioc_dev" },
+            "storage_account": { "type": "String", "defaultValue": "omniocdeveusst01" },
+            "trigger_once":    { "type": "String", "defaultValue": "true" },
+            "full_refresh":    { "type": "String", "defaultValue": "false" }
+        },
+        "annotations": ["project:omnioc-lakehouse", "pattern:databricks-orchestration"]
+    }
+}

@@ -1,0 +1,26 @@
+{
+    "name": "DS_ADLS_Json",
+    "properties": {
+        "description": "Parameterized ADLS Gen2 JSON Lines dataset.",
+        "type": "Json",
+        "linkedServiceName": {
+            "referenceName": "LS_ADLS_Gen2",
+            "type": "LinkedServiceReference"
+        },
+        "parameters": {
+            "container":   { "type": "String", "defaultValue": "landing" },
+            "folder_path": { "type": "String" },
+            "file_name":   { "type": "String", "defaultValue": "" }
+        },
+        "typeProperties": {
+            "location": {
+                "type": "AzureBlobFSLocation",
+                "fileSystem":   { "value": "@dataset().container",   "type": "Expression" },
+                "folderPath":   { "value": "@dataset().folder_path", "type": "Expression" },
+                "fileName":     { "value": "@if(equals(dataset().file_name,''),null,dataset().file_name)", "type": "Expression" }
+            },
+            "encodingName": "UTF-8"
+        },
+        "annotations": ["project:omnioc-lakehouse"]
+    }
+}

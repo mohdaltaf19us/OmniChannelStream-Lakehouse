@@ -1,0 +1,35 @@
+{
+    "name": "tr_tumbling_window_cdc",
+    "type": "Microsoft.DataFactory/factories/triggers",
+    "properties": {
+        "description": "Tumbling window trigger — fires every 15 minutes for CDC extraction. Tumbling windows guarantee exactly-once processing of each time slot even after pipeline retries. Window start/end passed as parameters to pl_cdc_extract.",
+        "type": "TumblingWindowTrigger",
+        "typeProperties": {
+            "frequency": "Minute",
+            "interval": 15,
+            "startTime": "2025-01-01T00:00:00Z",
+            "endTime": null,
+            "delay": "00:02:00",
+            "maxConcurrency": 1,
+            "retryPolicy": {
+                "count": 3,
+                "intervalInSeconds": 60
+            },
+            "dependsOn": []
+        },
+        "pipeline": {
+            "pipelineReference": {
+                "referenceName": "pl_cdc_extract",
+                "type": "PipelineReference"
+            },
+            "parameters": {
+                "extractDate": {
+                    "value": "@formatDateTime(trigger().outputs.windowStartTime, 'yyyy-MM-dd HH:mm:ss')",
+                    "type": "Expression"
+                }
+            }
+        },
+        "runtimeState": "Stopped",
+        "annotations": ["omnioc-lakehouse", "cdc", "tumbling-window", "15min"]
+    }
+}

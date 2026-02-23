@@ -1,0 +1,28 @@
+{
+    "name": "ds_http_fxrates",
+    "type": "Microsoft.DataFactory/factories/datasets",
+    "properties": {
+        "description": "HTTP source: open.er-api.com FX rates endpoint. Returns JSON with latest rates keyed by currency code.",
+        "linkedServiceName": {
+            "referenceName": "ls_http_fxrates_api",
+            "type": "LinkedServiceReference"
+        },
+        "parameters": {
+            "baseCurrency": {
+                "type": "String",
+                "defaultValue": "USD"
+            }
+        },
+        "type": "Json",
+        "typeProperties": {
+            "location": {
+                "type": "HttpServerLocation",
+                "relativeUrl": {
+                    "value": "@concat('v6/latest/', dataset().baseCurrency)",
+                    "type": "Expression"
+                }
+            }
+        },
+        "schema": {}
+    }
+}

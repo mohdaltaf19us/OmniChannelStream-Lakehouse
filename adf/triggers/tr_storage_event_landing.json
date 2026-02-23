@@ -1,0 +1,37 @@
+{
+    "name": "tr_storage_event_landing",
+    "type": "Microsoft.DataFactory/factories/triggers",
+    "properties": {
+        "description": "Event-based trigger — fires when a new Parquet or JSON file is created in the landing/ container. This enables near-real-time batch processing without polling. Filters to specific blob path patterns to avoid triggering on checkpoints or temp files.",
+        "type": "BlobEventsTrigger",
+        "typeProperties": {
+            "blobPathBeginsWith": "/landing/blobs/",
+            "blobPathEndsWith": "",
+            "blobPathPattern": "landing/**/*.{parquet,json,csv}",
+            "ignoreEmptyBlobs": true,
+            "scope": "/subscriptions/{subscriptionId}/resourceGroups/omnioc-dev-eus-rg-01/providers/Microsoft.Storage/storageAccounts/omniocdeveusst01",
+            "events": [
+                "Microsoft.Storage.BlobCreated"
+            ]
+        },
+        "pipelines": [
+            {
+                "pipelineReference": {
+                    "referenceName": "pl_trigger_databricks_batch",
+                    "type": "PipelineReference"
+                },
+                "parameters": {
+                    "batchJobId": 0,
+                    "catalog": "omnioc_dev",
+                    "runDate": {
+                        "value": "@formatDateTime(trigger().outputs.triggerBody.eventTime, 'yyyy-MM-dd')",
+                        "type": "Expression"
+                    },
+                    "triggerFullRefresh": false
+                }
+            }
+        ],
+        "runtimeState": "Stopped",
+        "annotations": ["omnioc-lakehouse", "event-driven", "landing", "storage-event"]
+    }
+}
