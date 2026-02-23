@@ -1,31 +1,26 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 01 Bronze Clickstream — Kafka Format (Event Hubs Kafka Endpoint)
-# MAGIC Reads from beginning. No Maven library needed. Works on any cluster access mode.
+# MAGIC # 01 Bronze Clickstream — Kafka Format (No Maven Library)
+# MAGIC Works on any cluster access mode. Uses built-in Kafka connector.
 
 # COMMAND ----------
+
 # DBTITLE 1, Config
 from pyspark.sql.functions import col, from_json, current_timestamp, lit
 from pyspark.sql.types import *
 
+EH_CONN_STR  = dbutils.secrets.get("omnioc-kv-scope", "eventhub-clickstream-connection-string")
 CHECKPOINT   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze/clickstream_kafka"
 TARGET_TABLE = "omnioc_dev.bronze.clickstream_raw_kafka"
-EH_NAMESPACE = "omnioc-dev-eus-ehns-std-01.servicebus.windows.net"
-EH_TOPIC     = "eh-clickstream"
 
-# Namespace-level connection string — strip EntityPath if present
-conn_str = dbutils.secrets.get("omnioc-kv-scope", "eventhub-clickstream-connection-string")
-if "EntityPath" in conn_str:
-    conn_str = ";".join(p for p in conn_str.split(";") if not p.startswith("EntityPath"))
-
-# DBR 15.4 uses standard org.apache.kafka — NOT kafkashaded prefix
+# Kafka SASL config — Event Hubs accepts Kafka protocol on port 9093
 JAAS = (
-    "org.apache.kafka.common.security.plain.PlainLoginModule required "
-    f'username="$ConnectionString" password="{conn_str}";'
+    "kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required "
+    f'username="$ConnectionString" password="{EH_CONN_STR}";'
 )
 
-# Payload schema — all types defined here, no inference
-PAYLOAD_SCHEMA = StructType([
+# Explicit schema — controls ALL types, no inference needed
+CLICKSTREAM_SCHEMA = StructType([
     StructField("event_id",           StringType(),  True),
     StructField("event_type",         StringType(),  True),
     StructField("session_id",         StringType(),  True),
@@ -49,33 +44,35 @@ PAYLOAD_SCHEMA = StructType([
     StructField("_is_poison_pill",    BooleanType(), True),
 ])
 
-print(f"✅ Target    : {TARGET_TABLE}")
-print(f"✅ Namespace : {EH_NAMESPACE}")
-print(f"✅ Topic     : {EH_TOPIC}")
-print(f"✅ Reading   : from beginning (earliest)")
+print(f"✅ Config ready  |  Target: {TARGET_TABLE}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Read → Cast → Write
-(spark.readStream
+raw = (spark.readStream
     .format("kafka")
-    .option("kafka.bootstrap.servers",                f"{EH_NAMESPACE}:9093")
-    .option("kafka.security.protocol",                "SASL_SSL")
-    .option("kafka.sasl.mechanism",                   "PLAIN")
-    .option("kafka.sasl.jaas.config",                 JAAS)
-    .option("kafka.request.timeout.ms",               "60000")
-    .option("kafka.session.timeout.ms",               "30000")
-    .option("subscribe",                              EH_TOPIC)
-    .option("startingOffsets",                        "earliest")   # read from beginning
-    .option("failOnDataLoss",                         "false")
-    .option("maxOffsetsPerTrigger",                   "500")
+    .option("kafka.bootstrap.servers",  "omnioc-dev-eus-ehns-std-01.servicebus.windows.net:9093")
+    .option("kafka.security.protocol",  "SASL_SSL")
+    .option("kafka.sasl.mechanism",     "PLAIN")
+    .option("kafka.sasl.jaas.config",   JAAS)
+    .option("subscribe",                "eh-clickstream")
+    .option("kafka.group.id",           "cg-dbx-stream")
+    .option("startingOffsets",          "earliest")
+    .option("failOnDataLoss",           "false")
+    .option("maxOffsetsPerTrigger",     "500")
     .load()
+)
+
+parsed = (raw
+    # Parse JSON value using explicit schema — types fully controlled here
     .select(
-        from_json(col("value").cast(StringType()), PAYLOAD_SCHEMA).alias("d"),
-        col("timestamp").cast(TimestampType()).alias("_eh_enqueued_time"),
+        from_json(col("value").cast(StringType()), CLICKSTREAM_SCHEMA).alias("d"),
+        col("timestamp").cast(TimestampType()).alias("_eh_enqueued_time"),  # Kafka timestamp
         col("partition").cast(StringType()).alias("_eh_partition"),
         col("offset").cast(StringType()).alias("_eh_offset"),
     )
     .select(
+        # All fields come out with correct types from schema above
         col("d.event_id"),
         col("d.event_type"),
         col("d.session_id"),
@@ -88,70 +85,40 @@ print(f"✅ Reading   : from beginning (earliest)")
         col("d.product_id"),
         col("d.category"),
         col("d.search_query"),
-        col("d.cart_value"),            # Double — from schema
-        col("d.purchase_amount"),       # Double — from schema
+        col("d.cart_value"),           # DOUBLE — from schema
+        col("d.purchase_amount"),      # DOUBLE — from schema
         col("d.ip_address"),
         col("d.user_agent"),
         col("d.geo_country"),
         col("d.geo_city"),
-        col("d.session_page_count"),    # Int — from schema
-        col("d._is_late_arrival"),      # Boolean — from schema
-        col("d._is_poison_pill"),       # Boolean — from schema
+        col("d.session_page_count"),   # INT — from schema
+        col("d._is_late_arrival"),     # BOOLEAN — from schema
+        col("d._is_poison_pill"),      # BOOLEAN — from schema
         "_eh_enqueued_time",
         "_eh_partition",
         "_eh_offset",
         current_timestamp().alias("_ingest_time"),
         lit("eventhubs_kafka").alias("_source_system"),
     )
-    .writeStream
+)
+
+query = (parsed.writeStream
     .format("delta")
     .outputMode("append")
     .option("checkpointLocation", CHECKPOINT)
     .option("mergeSchema",        "true")
-    .trigger(processingTime="30 seconds")
+    # .trigger(processingTime="30 seconds")
+    .trigger(once=True)
     .toTable(TARGET_TABLE)
 )
 
-print(f"✅ Streaming started → {TARGET_TABLE}  |  stop with ■")
+print(f"✅ Streaming to {TARGET_TABLE}  |  trigger: 30s  |  stop with ■")
 
 # COMMAND ----------
-# MAGIC %md ## Summary Stats
 
-# COMMAND ----------
-# DBTITLE 1, Row count and ingest times
-from pyspark.sql.functions import max as spark_max, min as spark_min
-
-df    = spark.table(TARGET_TABLE)
-total = df.count()
-
-print(f"  {'Table':<40}  {TARGET_TABLE}")
-print(f"  {'Total rows':<40}  {total:,}")
-if total > 0:
-    print(f"  {'Latest _ingest_time':<40}  {df.select(spark_max('_ingest_time')).collect()[0][0]}")
-    print(f"  {'Earliest EH enqueue':<40}  {df.select(spark_min('_eh_enqueued_time')).collect()[0][0]}")
-    print(f"  {'Latest EH enqueue':<40}  {df.select(spark_max('_eh_enqueued_time')).collect()[0][0]}")
-
-# COMMAND ----------
-# DBTITLE 1, Event type breakdown
-if total > 0:
-    df.groupBy("event_type").count().orderBy("count", ascending=False).show()
-
-# COMMAND ----------
-# DBTITLE 1, DQ flags — late arrivals and poison pills
-if total > 0:
-    late  = df.filter(col("_is_late_arrival") == True).count()
-    pills = df.filter(col("_is_poison_pill")  == True).count()
-    print(f"  Late arrivals  : {late:,}  ({late/total*100:.1f}%)")
-    print(f"  Poison pills   : {pills:,}  ({pills/total*100:.1f}%)")
-
-# COMMAND ----------
-# DBTITLE 1, Partition distribution
-if total > 0:
-    df.groupBy("_eh_partition").count().orderBy("_eh_partition").show()
-
-# COMMAND ----------
-# DBTITLE 1, Sample rows
-if total > 0:
-    df.select(
-        "event_id","event_type","user_id","geo_country","cart_value","_eh_enqueued_time","_ingest_time"
-    ).show(5, truncate=False)
+# DBTITLE 1, Live monitor (run while streaming)
+import time
+for i in range(12):
+    count = spark.table(TARGET_TABLE).count()
+    print(f"  [{i*15:>3}s]  {TARGET_TABLE}  →  {count:,} rows")
+    time.sleep(15)
