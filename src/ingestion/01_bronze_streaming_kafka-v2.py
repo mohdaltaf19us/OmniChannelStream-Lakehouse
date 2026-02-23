@@ -12,6 +12,7 @@
 # MAGIC | 7 | Row counts — run after stopping |
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 1 — Common config, schemas, helpers
 from pyspark.sql.functions import col, from_json, current_timestamp, lit, to_json
 from pyspark.sql.types import *
@@ -177,9 +178,10 @@ print(f"   Checkpoint: {CHKPT_BASE}")
 print(f"   Catalog   : {CATALOG}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 2 — Stream: clickstream_raw_kafka
 q_clickstream = write_stream(
-    kafka_envelope(kafka_stream("clickstream-events"))
+    kafka_envelope(kafka_stream("eh-clickstream"))
     .select(
         from_json(col("value").cast(StringType()), CLICKSTREAM_SCHEMA).alias("d"),
         "_eh_enqueued_time", "_eh_partition", "_eh_offset",
@@ -200,6 +202,7 @@ q_clickstream = write_stream(
 print("✅ Stream started → clickstream_raw_kafka")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 3 — Stream: device_telemetry_raw_kafka
 q_telemetry = write_stream(
     kafka_envelope(kafka_stream("device-telemetry"))
@@ -229,6 +232,7 @@ q_telemetry = write_stream(
 print("✅ Stream started → device_telemetry_raw_kafka")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 4 — Stream: order_events_raw_kafka
 q_orders = write_stream(
     kafka_envelope(kafka_stream("order-events"))
@@ -252,6 +256,7 @@ q_orders = write_stream(
 print("✅ Stream started → order_events_raw_kafka")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 5 — Stream: dq_alerts_raw_kafka
 q_dq = write_stream(
     kafka_envelope(kafka_stream("dq-alerts"))
@@ -274,10 +279,12 @@ q_dq = write_stream(
 print("✅ Stream started → dq_alerts_raw_kafka")
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 6 — Block (stop with ■ Interrupt)
 spark.streams.awaitAnyTermination()
 
 # COMMAND ----------
+
 # DBTITLE 1, Cell 7 — Row counts (run after stopping)
 from pyspark.sql.functions import max as spark_max
 
