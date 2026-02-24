@@ -1,8 +1,0 @@
-{
-    "name": "IR_SelfHosted_OnPrem",
-    "properties": {
-        "description": "Self-Hosted Integration Runtime to reach Docker SQL Server (localhost:1433).\n                   Install SHIR on the same machine running Docker.\n                   Download: https://www.microsoft.com/en-us/download/details.aspx?id=39717\n\n                   Install steps:\n                   1. Download SHIR MSI from the link above\n                   2. Install on the host machine (where Docker is running)\n                   3. Register with the auth key shown in ADF portal:\n                      ADF → Manage → Integration Runtimes → IR_SelfHosted_OnPrem → Keys\n                   4. Verify: Status shows 'Running' in ADF portal",
-        "type": "SelfHosted",
-        "typeProperties": {}
-    }
-}
