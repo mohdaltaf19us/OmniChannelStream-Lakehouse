@@ -1,0 +1,9 @@
+{
+	"name": "omnioc-dev-eus-adf-01",
+	"location": "eastus",
+	"identity": {
+		"type": "SystemAssigned",
+		"principalId": "05726339-a000-4045-868b-c4faca502d65",
+		"tenantId": "04ea7ebb-1eef-43b3-a5cd-d750a20e6967"
+	}
+}

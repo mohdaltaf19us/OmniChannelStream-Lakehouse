@@ -16,6 +16,7 @@
 # MAGIC - Stop all streams with **■ Interrupt**
 
 # COMMAND ----------
+
 # DBTITLE 1, Config — JAAS, schemas, checkpoints
 from pyspark.sql.functions import col, from_json, current_timestamp, lit, to_json
 from pyspark.sql.types import *
@@ -32,9 +33,9 @@ CG           = "cg-dbx-stream"
 CHKPT_BASE   = "abfss://checkpoint@omniocdeveusst01.dfs.core.windows.net/bronze"
 CATALOG      = "omnioc_dev.bronze"
 
-# DBR 15.4 — standard class, NOT kafkashaded prefix
+# DBR 15.4 — kafkashaded prefix for Event Hubs
 JAAS = (
-    "org.apache.kafka.common.security.plain.PlainLoginModule required "
+    "kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required "
     f'username="$ConnectionString" password="{NS_CONN_STR}";'
 )
 
@@ -154,11 +155,12 @@ DQ_ALERTS_SCHEMA = StructType([
 print(f"✅ Bootstrap : {EH_BOOTSTRAP}")
 print(f"✅ Consumer  : {CG}")
 print(f"✅ Checkpoint: {CHKPT_BASE}")
-print(f"✅ JAAS      : org.apache.kafka... (DBR 15.4 standard class)")
+print(f"✅ JAAS      : kafkashaded.org.apache.kafka... (DBR 15.4 shaded class)")
 print(f"✅ Schemas   : 4 defined — clickstream, telemetry, order_events, dq_alerts")
 print("✅ Config ready — run next cell to start all 4 streams")
 
 # COMMAND ----------
+
 # DBTITLE 1, Start all 4 streams
 def kafka_stream(topic):
     """Create a readStream for a given EH/Kafka topic."""
@@ -182,7 +184,7 @@ def kafka_envelope(raw):
 
 # ── 1. Clickstream ─────────────────────────────────────────────────────────────
 q_clickstream = (
-    kafka_envelope(kafka_stream("clickstream-events"))
+    kafka_envelope(kafka_stream("eh-clickstream"))
     .select(
         from_json(col("value").cast(StringType()), CLICKSTREAM_SCHEMA).alias("d"),
         "_eh_enqueued_time", "_eh_partition", "_eh_offset",
@@ -316,6 +318,7 @@ print()
 print("  All 4 streams running. Next cell will block — stop with ■")
 
 # COMMAND ----------
+
 # DBTITLE 1, Block until interrupted — surfaces real error if any stream crashes
 try:
     spark.streams.awaitAnyTermination()
@@ -327,9 +330,11 @@ except Exception as e:
             print(f"  → {name}: {q.exception()}")
 
 # COMMAND ----------
+
 # MAGIC %md ## Summary Stats — run after stopping streams
 
 # COMMAND ----------
+
 # DBTITLE 1, Row counts — all 4 tables
 from pyspark.sql.functions import max as spark_max
 
@@ -350,6 +355,7 @@ for tbl in STREAM_TABLES:
     print(f"  {status}  {tbl:<36}  {rows:>8,}  {latest}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Clickstream — event types and DQ flags
 df_cs = spark.table(f"{CATALOG}.clickstream_raw_kafka")
 if df_cs.count() > 0:
@@ -361,6 +367,7 @@ if df_cs.count() > 0:
     print(f"  Poison pills  : {pills:,}  ({pills/total*100:.1f}%)")
 
 # COMMAND ----------
+
 # DBTITLE 1, Telemetry — device status and alerts
 df_tel = spark.table(f"{CATALOG}.device_telemetry_raw_kafka")
 if df_tel.count() > 0:
@@ -370,6 +377,7 @@ if df_tel.count() > 0:
     print(f"  Alerts triggered : {alerts:,}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Order events — event type and poison pills
 df_ord = spark.table(f"{CATALOG}.order_events_raw_kafka")
 if df_ord.count() > 0:
@@ -378,6 +386,7 @@ if df_ord.count() > 0:
     print(f"  Poison pills : {pills:,}")
 
 # COMMAND ----------
+
 # DBTITLE 1, DQ alerts — severity and action breakdown
 df_dq = spark.table(f"{CATALOG}.dq_alerts_raw_kafka")
 if df_dq.count() > 0:
@@ -387,6 +396,7 @@ if df_dq.count() > 0:
     print(f"  Resolution required : {critical:,}")
 
 # COMMAND ----------
+
 # DBTITLE 1, Kafka partition distribution — all tables
 for tbl in STREAM_TABLES:
     df = spark.table(f"{CATALOG}.{tbl}")
